@@ -236,9 +236,9 @@ def build_prompt(
             "For repos: include a brief evaluation (impact/risk/regression) per repo.",
             "If diffs are missing or patch_truncated is true, say so explicitly.",
             "Write the report in Chinese.",
-            "总结仓库的改动时，需要在其后附上 github 的 PR 链接，方便跳转。没有 PR 链接就给出 commit 名称。",
+            "总结仓库的改动时，需要在你说出的每个总结的点上都附上对应的 github 的 PR 链接，方便跳转。没有 PR 链接就给出 commit 名称。",
             "总结不能过于潦草，需要严谨地指出，哪里组件/模块改动了什么具体细节，最好有简短的代码片段。",
-        ],
+        ],ß
     }
     return json.dumps(payload, ensure_ascii=True)
 
