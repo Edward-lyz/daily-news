@@ -15,10 +15,14 @@ def utc_today() -> datetime.date:
     return datetime.datetime.now(tz=UTC).date()
 
 
-def date_range_for_yesterday() -> Tuple[datetime.date, datetime.datetime, datetime.datetime]:
+def date_range_for_yesterday() -> Tuple[
+    datetime.date, datetime.datetime, datetime.datetime
+]:
     today = utc_today()
     y_date = today - datetime.timedelta(days=1)
-    start = datetime.datetime(y_date.year, y_date.month, y_date.day, 0, 0, 0, tzinfo=UTC)
+    start = datetime.datetime(
+        y_date.year, y_date.month, y_date.day, 0, 0, 0, tzinfo=UTC
+    )
     end = start + datetime.timedelta(days=1)
     return y_date, start, end
 
@@ -37,7 +41,9 @@ def truncate_text(text: str, max_chars: int, suffix: str = "...") -> str:
     return text[: max_chars - len(suffix)] + suffix
 
 
-def limit_diff_budget(commits: Dict[str, List[Dict[str, Any]]], max_total_chars: int) -> int:
+def limit_diff_budget(
+    commits: Dict[str, List[Dict[str, Any]]], max_total_chars: int
+) -> int:
     if max_total_chars <= 0:
         return 0
     remaining = max_total_chars
@@ -79,13 +85,17 @@ def fetch_arxiv(query: str, max_results: int = 50) -> List[Any]:
 
 
 def entry_date(entry: Any) -> datetime.date:
-    parsed = getattr(entry, "updated_parsed", None) or getattr(entry, "published_parsed", None)
+    parsed = getattr(entry, "updated_parsed", None) or getattr(
+        entry, "published_parsed", None
+    )
     if not parsed:
         return datetime.datetime.now(tz=UTC).date()
     return datetime.datetime(*parsed[:6], tzinfo=UTC).date()
 
 
-def filter_yesterday_arxiv(entries: List[Any], y_date: datetime.date) -> List[Dict[str, Any]]:
+def filter_yesterday_arxiv(
+    entries: List[Any], y_date: datetime.date
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for entry in entries:
         if entry_date(entry) != y_date:
@@ -101,7 +111,9 @@ def filter_yesterday_arxiv(entries: List[Any], y_date: datetime.date) -> List[Di
     return out
 
 
-def fetch_github_commits(repo: str, since_iso: str, token: str | None = None) -> List[Dict[str, Any]]:
+def fetch_github_commits(
+    repo: str, since_iso: str, token: str | None = None
+) -> List[Dict[str, Any]]:
     url = f"https://api.github.com/repos/{repo}/commits"
     headers = {"Accept": "application/vnd.github+json"}
     if token:
@@ -166,7 +178,9 @@ def fetch_commit_detail(
     }
 
 
-def openrouter_summarize(prompt: str, model: str, retry_max: int, retry_base_seconds: int) -> str:
+def openrouter_summarize(
+    prompt: str, model: str, retry_max: int, retry_base_seconds: int
+) -> str:
     key = os.environ["OPENROUTER_API_KEY"]
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -200,11 +214,17 @@ def openrouter_summarize(prompt: str, model: str, retry_max: int, retry_base_sec
                 delay = retry_base_seconds * (2**attempt)
             time.sleep(min(delay, 60))
             continue
-        raise RuntimeError(f"OpenRouter {response.status_code} {response.reason}: {detail}")
+        raise RuntimeError(
+            f"OpenRouter {response.status_code} {response.reason}: {detail}"
+        )
     raise RuntimeError("OpenRouter summarize failed: retry budget exhausted.")
 
 
-def build_prompt(date_str: str, papers: List[Dict[str, Any]], commits: Dict[str, List[Dict[str, Any]]]) -> str:
+def build_prompt(
+    date_str: str,
+    papers: List[Dict[str, Any]],
+    commits: Dict[str, List[Dict[str, Any]]],
+) -> str:
     payload = {
         "date": date_str,
         "papers": papers,
@@ -216,6 +236,8 @@ def build_prompt(date_str: str, papers: List[Dict[str, Any]], commits: Dict[str,
             "For repos: include a brief evaluation (impact/risk/regression) per repo.",
             "If diffs are missing or patch_truncated is true, say so explicitly.",
             "Write the report in Chinese.",
+            "总结仓库的改动时，需要在其后附上 github 的 PR 链接，方便跳转。没有 PR 链接就给出 commit 名称。",
+            "总结不能过于潦草，需要严谨地指出，哪里组件/模块改动了什么具体细节，最好有简短的代码片段。",
         ],
     }
     return json.dumps(payload, ensure_ascii=True)
@@ -284,7 +306,9 @@ def render_fallback_markdown(
                     additions = file_item.get("additions", 0)
                     deletions = file_item.get("deletions", 0)
                     truncated = file_item.get("patch_truncated")
-                    lines.append(f"    - {status}: {filename} (+{additions}/-{deletions})")
+                    lines.append(
+                        f"    - {status}: {filename} (+{additions}/-{deletions})"
+                    )
                     patch = (file_item.get("patch") or "").strip()
                     if patch:
                         lines.append("      ```diff")
@@ -315,12 +339,16 @@ def main() -> None:
     errors: List[str] = []
 
     try:
-        arxiv_entries = fetch_arxiv(cfg["arxiv"]["query"], cfg["arxiv"].get("max_results", 50))
+        arxiv_entries = fetch_arxiv(
+            cfg["arxiv"]["query"], cfg["arxiv"].get("max_results", 50)
+        )
     except Exception as exc:  # noqa: BLE001 - want a single fallback path
         arxiv_entries = []
         errors.append(f"arXiv fetch failed: {exc}")
 
-    papers = filter_yesterday_arxiv(arxiv_entries, y_date)[: cfg["arxiv"].get("top_n", 15)]
+    papers = filter_yesterday_arxiv(arxiv_entries, y_date)[
+        : cfg["arxiv"].get("top_n", 15)
+    ]
 
     gh_token = os.environ.get("GITHUB_TOKEN")
     commits: Dict[str, List[Dict[str, Any]]] = {}
@@ -330,19 +358,25 @@ def main() -> None:
     max_total_diff_chars = int(cfg["github"].get("max_total_diff_chars", 0))
     for repo in cfg["github"].get("repos", []):
         try:
-            repo_commits = fetch_github_commits(repo, since_iso, token=gh_token)[:max_commits]
+            repo_commits = fetch_github_commits(repo, since_iso, token=gh_token)[
+                :max_commits
+            ]
             for item in repo_commits:
                 full_sha = item.get("full_sha", "")
                 if not full_sha:
                     continue
                 try:
-                    detail = fetch_commit_detail(repo, full_sha, gh_token, max_files, max_diff_chars)
+                    detail = fetch_commit_detail(
+                        repo, full_sha, gh_token, max_files, max_diff_chars
+                    )
                     item["files"] = detail["files"]
                     item["stats"] = detail["stats"]
                     item["truncated_files"] = detail["truncated_files"]
                 except Exception as exc:  # noqa: BLE001 - want a single fallback path
                     item["files"] = []
-                    errors.append(f"GitHub diff fetch failed for {repo}@{item.get('sha')}: {exc}")
+                    errors.append(
+                        f"GitHub diff fetch failed for {repo}@{item.get('sha')}: {exc}"
+                    )
             commits[repo] = repo_commits
         except Exception as exc:  # noqa: BLE001 - want a single fallback path
             commits[repo] = []
@@ -363,7 +397,9 @@ def main() -> None:
             retry_base_seconds = int(cfg["openrouter"].get("retry_base_seconds", 10))
             for model in models:
                 try:
-                    report = openrouter_summarize(prompt, model, retry_max, retry_base_seconds)
+                    report = openrouter_summarize(
+                        prompt, model, retry_max, retry_base_seconds
+                    )
                     if report:
                         break
                 except Exception as exc:  # noqa: BLE001 - want a single fallback path
