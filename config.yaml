@@ -1,0 +1,22 @@
+arxiv:
+  # Start broad; refine once the pipeline runs reliably.
+  query: '(cat:cs.LG OR cat:cs.DC OR cat:cs.PF) AND (GPU OR CUDA OR "distributed training" OR inference OR serving OR kernel)'
+  max_results: 80
+  top_n: 15
+
+github:
+  repos:
+    - "deepseek-ai/DeepGEMM"
+    - "deepseek-ai/FlashMLA"
+    - "NVIDIA/cutlass"
+    - "flashinfer-ai/flashinfer"
+    - "Dao-AILab/flash-attention"
+    - "sgl-project/sglang"
+    - "vllm-project/vllm"
+  max_commits_per_repo: 16
+  max_files_per_commit: 16
+  max_diff_chars: 1200
+
+openrouter:
+  # Choose a free/low-cost model you have verified.
+  model: "moonshotai/kimi-k2:free"
