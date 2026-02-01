@@ -69,6 +69,33 @@ def limit_diff_budget(
     return truncated
 
 
+def limit_issue_budget(
+    issues: Dict[str, List[Dict[str, Any]]], max_total_chars: int
+) -> int:
+    if max_total_chars <= 0:
+        return 0
+    remaining = max_total_chars
+    truncated = 0
+    for repo_items in issues.values():
+        for item in repo_items:
+            body = item.get("body", "") or ""
+            if not body:
+                continue
+            if remaining <= 0:
+                item["body"] = ""
+                item["body_truncated"] = True
+                truncated += 1
+                continue
+            if len(body) > remaining:
+                item["body"] = truncate_text(body, remaining)
+                item["body_truncated"] = True
+                truncated += 1
+                remaining = 0
+            else:
+                remaining -= len(body)
+    return truncated
+
+
 def fetch_arxiv(query: str, max_results: int = 50) -> List[Any]:
     url = "https://export.arxiv.org/api/query"
     params = {
@@ -168,6 +195,7 @@ def fetch_commit_detail(
                 "deletions": file_item.get("deletions", 0),
                 "changes": file_item.get("changes", 0),
                 "patch": truncate_text(patch, max_diff_chars),
+                "patch_truncated": len(patch) > max_diff_chars,
             }
         )
 
@@ -176,6 +204,47 @@ def fetch_commit_detail(
         "stats": data.get("stats") or {},
         "truncated_files": len(raw_files) > max_files,
     }
+
+
+def fetch_github_issues(
+    repo: str,
+    since_iso: str,
+    start: datetime.datetime,
+    end: datetime.datetime,
+    token: str | None = None,
+) -> List[Dict[str, Any]]:
+    url = f"https://api.github.com/repos/{repo}/issues"
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    params = {"since": since_iso, "state": "all", "per_page": 100}
+    response = requests.get(url, headers=headers, params=params, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    out: List[Dict[str, Any]] = []
+    for item in data:
+        if "pull_request" in item:
+            continue
+        created_at = item.get("created_at") or ""
+        try:
+            created_dt = datetime.datetime.fromisoformat(
+                created_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            continue
+        if not (start <= created_dt < end):
+            continue
+        out.append(
+            {
+                "title": item.get("title", ""),
+                "url": item.get("html_url", ""),
+                "author": (item.get("user") or {}).get("login", ""),
+                "created_at": created_at,
+                "comments": item.get("comments", 0),
+                "body": item.get("body") or "",
+            }
+        )
+    return out
 
 
 def openrouter_summarize(
@@ -224,17 +293,21 @@ def build_prompt(
     date_str: str,
     papers: List[Dict[str, Any]],
     commits: Dict[str, List[Dict[str, Any]]],
+    issues: Dict[str, List[Dict[str, Any]]],
 ) -> str:
     payload = {
         "date": date_str,
         "papers": papers,
         "commits": commits,
+        "issues": issues,
         "requirements": [
-            "Return a Markdown report with three top-level sections: 摘要, 具体内容分析, 总结.",
+            "Return a Markdown report with three top-level sections: 摘要, 具体内容分析, 总结 (use ## headings).",
             "For papers: include a 1-line why it matters (AI infra angle).",
             "For repos: use file-level diffs in commits[*].files[*].patch to summarize changes.",
             "For repos: include a brief evaluation (impact/risk/regression) per repo.",
+            "For issues: summarize newly created issues per repo and explain potential impact.",
             "If diffs are missing or patch_truncated is true, say so explicitly.",
+            "If issue body is missing or body_truncated is true, say so explicitly.",
             "Write the report in Chinese.",
             "总结仓库的改动时，需要在你说出的每个总结的点上都附上对应的 github 的 PR 链接，方便跳转。没有 PR 链接就给出 commit 名称。",
             "总结不能过于潦草，需要严谨地指出，哪里组件/模块改动了什么具体细节，最好有简短的代码片段。",
@@ -247,16 +320,19 @@ def render_fallback_markdown(
     date_str: str,
     papers: List[Dict[str, Any]],
     commits: Dict[str, List[Dict[str, Any]]],
+    issues: Dict[str, List[Dict[str, Any]]],
     errors: List[str],
 ) -> str:
     lines: List[str] = []
-    lines.append(f"# Daily AI Infra Report - {date_str}")
+    lines.append(f"# AI Infra 日报 - {date_str}")
     lines.append("")
-    lines.append("Generated from raw data because summarization was unavailable.")
+    lines.append("## 摘要")
+    lines.append("模型摘要不可用，以下为原始数据整理。")
     lines.append("")
-    lines.append("## Papers")
+    lines.append("## 具体内容分析")
+    lines.append("### 论文")
     if not papers:
-        lines.append("- No papers matched the date filter.")
+        lines.append("- 未找到符合日期过滤的论文。")
     else:
         for paper in papers:
             title = paper.get("title", "").strip()
@@ -270,14 +346,14 @@ def render_fallback_markdown(
             if summary:
                 lines.append(f"  - {summary}")
     lines.append("")
-    lines.append("## Repos")
+    lines.append("### 代码提交")
     if not commits:
-        lines.append("- No repos configured.")
+        lines.append("- 未配置仓库。")
     else:
         for repo, items in commits.items():
-            lines.append(f"### {repo}")
+            lines.append(f"#### {repo}")
             if not items:
-                lines.append("- No commits in the window.")
+                lines.append("- 时间窗口内无提交。")
                 continue
             for item in items:
                 sha = item.get("sha", "")
@@ -294,12 +370,12 @@ def render_fallback_markdown(
                     )
                 files = item.get("files") or []
                 if not files:
-                    lines.append("  - Diff not available.")
+                    lines.append("  - 无法获取 diff。")
                     continue
                 if item.get("truncated_files"):
-                    lines.append("  - Files (truncated):")
+                    lines.append("  - 文件列表（截断）：")
                 else:
-                    lines.append("  - Files:")
+                    lines.append("  - 文件列表：")
                 for file_item in files:
                     filename = file_item.get("filename", "")
                     status = file_item.get("status", "")
@@ -315,12 +391,42 @@ def render_fallback_markdown(
                         lines.extend([f"      {line}" for line in patch.splitlines()])
                         lines.append("      ```")
                     if truncated:
-                        lines.append("      - Diff truncated to fit prompt budget.")
+                        lines.append("      - Diff 已截断以满足 prompt 预算。")
+    lines.append("")
+    lines.append("### 新增 Issues")
+    if not issues:
+        lines.append("- 未配置仓库。")
+    else:
+        for repo, items in issues.items():
+            lines.append(f"#### {repo}")
+            if not items:
+                lines.append("- 时间窗口内无新增 issue。")
+                continue
+            for item in items:
+                title = item.get("title", "").strip()
+                url = item.get("url", "").strip()
+                author = item.get("author", "")
+                comments = item.get("comments", 0)
+                header = f"- [{title}]({url})"
+                if author:
+                    header += f" ({author})"
+                if comments:
+                    header += f" - {comments} 条评论"
+                lines.append(header)
+                body = (item.get("body") or "").strip()
+                if body:
+                    lines.append(f"  - {body}")
+                if item.get("body_truncated"):
+                    lines.append("  - Issue 内容已截断以满足 prompt 预算。")
+    lines.append("")
+    lines.append("## 总结")
     if errors:
-        lines.append("")
-        lines.append("## Notes")
         for err in errors:
             lines.append(f"- {err}")
+    else:
+        lines.append(
+            f"- 论文: {len(papers)}; 仓库: {len(commits)}; Issues: {sum(len(v) for v in issues.values())}."
+        )
     lines.append("")
     return "\n".join(lines)
 
@@ -330,9 +436,58 @@ def load_config(path: str) -> Dict[str, Any]:
         return yaml.safe_load(handle)
 
 
+def list_report_dates(report_dir: str = "reports") -> List[str]:
+    if not os.path.isdir(report_dir):
+        return []
+    dates: List[str] = []
+    for name in os.listdir(report_dir):
+        if not name.endswith(".md"):
+            continue
+        stem = name[:-3]
+        try:
+            datetime.date.fromisoformat(stem)
+        except ValueError:
+            continue
+        dates.append(stem)
+    return sorted(dates, reverse=True)
+
+
+def normalize_report_for_readme(report: str) -> str:
+    lines = report.strip().splitlines()
+    if lines and lines[0].lstrip().startswith("#"):
+        lines = lines[1:]
+        if lines and not lines[0].strip():
+            lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+def build_readme(date_str: str, report: str, archive_dates: List[str]) -> str:
+    lines: List[str] = []
+    lines.append("# Daily AI Infra Report")
+    lines.append("")
+    lines.append("## 往期回顾")
+    filtered_dates = [d for d in archive_dates if d != date_str]
+    if filtered_dates:
+        for report_date in filtered_dates:
+            lines.append(f"- [{report_date}](reports/{report_date}.md)")
+    else:
+        lines.append("- 暂无往期记录")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"## 最新解读 ({date_str})")
+    body = normalize_report_for_readme(report)
+    if body:
+        lines.append(body)
+    else:
+        lines.append("暂无内容")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def main() -> None:
     cfg = load_config("config.yaml")
-    y_date, y_start, _ = date_range_for_yesterday()
+    y_date, y_start, y_end = date_range_for_yesterday()
     since_iso = y_start.isoformat().replace("+00:00", "Z")
     date_str = str(y_date)
 
@@ -356,6 +511,10 @@ def main() -> None:
     max_files = int(cfg["github"].get("max_files_per_commit", 6))
     max_diff_chars = int(cfg["github"].get("max_diff_chars", 1200))
     max_total_diff_chars = int(cfg["github"].get("max_total_diff_chars", 0))
+    issues: Dict[str, List[Dict[str, Any]]] = {}
+    max_issues = int(cfg["github"].get("max_issues_per_repo", 8))
+    max_issue_body_chars = int(cfg["github"].get("max_issue_body_chars", 800))
+    max_total_issue_body_chars = int(cfg["github"].get("max_total_issue_body_chars", 0))
     for repo in cfg["github"].get("repos", []):
         try:
             repo_commits = fetch_github_commits(repo, since_iso, token=gh_token)[
@@ -382,14 +541,36 @@ def main() -> None:
             commits[repo] = []
             errors.append(f"GitHub fetch failed for {repo}: {exc}")
 
+    for repo in cfg["github"].get("repos", []):
+        try:
+            repo_issues = fetch_github_issues(
+                repo, since_iso, y_start, y_end, token=gh_token
+            )
+            repo_issues.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+            repo_issues = repo_issues[:max_issues]
+            for item in repo_issues:
+                body = item.get("body") or ""
+                item["body_truncated"] = False
+                if body:
+                    item["body"] = truncate_text(body, max_issue_body_chars)
+                    item["body_truncated"] = len(body) > max_issue_body_chars
+            issues[repo] = repo_issues
+        except Exception as exc:  # noqa: BLE001 - want a single fallback path
+            issues[repo] = []
+            errors.append(f"GitHub issues fetch failed for {repo}: {exc}")
+
     truncated_count = limit_diff_budget(commits, max_total_diff_chars)
     if truncated_count:
-        errors.append("Diff content truncated to fit prompt budget.")
+        errors.append("Diff 内容已截断以满足 prompt 预算。")
+
+    issue_truncated_count = limit_issue_budget(issues, max_total_issue_body_chars)
+    if issue_truncated_count:
+        errors.append("Issue 内容已截断以满足 prompt 预算。")
 
     report = ""
     if os.environ.get("OPENROUTER_API_KEY"):
         try:
-            prompt = build_prompt(date_str, papers, commits)
+            prompt = build_prompt(date_str, papers, commits, issues)
             models = cfg.get("openrouter", {}).get("models")
             if not models:
                 models = [cfg.get("openrouter", {}).get("model", "openrouter/auto")]
@@ -408,7 +589,7 @@ def main() -> None:
             errors.append(f"OpenRouter summarize failed: {exc}")
 
     if not report:
-        report = render_fallback_markdown(date_str, papers, commits, errors)
+        report = render_fallback_markdown(date_str, papers, commits, issues, errors)
 
     os.makedirs("reports", exist_ok=True)
     out_path = os.path.join("reports", f"{date_str}.md")
@@ -416,8 +597,8 @@ def main() -> None:
         handle.write(report.strip() + "\n")
 
     with open("README.md", "w", encoding="utf-8") as handle:
-        handle.write("# Daily AI Infra Report\n\n")
-        handle.write(f"- Latest: [{date_str}](reports/{date_str}.md)\n")
+        archive_dates = list_report_dates()
+        handle.write(build_readme(date_str, report, archive_dates))
 
 
 if __name__ == "__main__":

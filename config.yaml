@@ -17,6 +17,9 @@ github:
   max_files_per_commit: 16
   max_diff_chars: 1200
   max_total_diff_chars: 20000
+  max_issues_per_repo: 8
+  max_issue_body_chars: 800
+  max_total_issue_body_chars: 12000
 
 openrouter:
   # Choose free/low-cost models to try in order.
