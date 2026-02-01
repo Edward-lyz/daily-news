@@ -16,6 +16,7 @@ github:
   max_commits_per_repo: 16
   max_files_per_commit: 16
   max_diff_chars: 1200
+  max_total_diff_chars: 20000
 
 openrouter:
   # Choose a free/low-cost model you have verified.

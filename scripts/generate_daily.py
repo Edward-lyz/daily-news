@@ -36,6 +36,32 @@ def truncate_text(text: str, max_chars: int, suffix: str = "...") -> str:
     return text[: max_chars - len(suffix)] + suffix
 
 
+def limit_diff_budget(commits: Dict[str, List[Dict[str, Any]]], max_total_chars: int) -> int:
+    if max_total_chars <= 0:
+        return 0
+    remaining = max_total_chars
+    truncated = 0
+    for repo_items in commits.values():
+        for item in repo_items:
+            for file_item in item.get("files") or []:
+                patch = file_item.get("patch") or ""
+                if not patch:
+                    continue
+                if remaining <= 0:
+                    file_item["patch"] = ""
+                    file_item["patch_truncated"] = True
+                    truncated += 1
+                    continue
+                if len(patch) > remaining:
+                    file_item["patch"] = truncate_text(patch, remaining)
+                    file_item["patch_truncated"] = True
+                    truncated += 1
+                    remaining = 0
+                else:
+                    remaining -= len(patch)
+    return truncated
+
+
 def fetch_arxiv(query: str, max_results: int = 50) -> List[Any]:
     url = "https://export.arxiv.org/api/query"
     params = {
@@ -157,8 +183,10 @@ def openrouter_summarize(prompt: str, model: str) -> str:
         ],
         "temperature": 0.2,
     }
-    response = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
-    response.raise_for_status()
+    response = requests.post(url, headers=headers, json=body, timeout=60)
+    if not response.ok:
+        detail = truncate_text(response.text.strip(), 2000)
+        raise RuntimeError(f"OpenRouter {response.status_code} {response.reason}: {detail}")
     data = response.json()
     return data["choices"][0]["message"]["content"]
 
@@ -173,7 +201,7 @@ def build_prompt(date_str: str, papers: List[Dict[str, Any]], commits: Dict[str,
             "For papers: include a 1-line why it matters (AI infra angle).",
             "For repos: use file-level diffs in commits[*].files[*].patch to summarize changes.",
             "For repos: include a brief evaluation (impact/risk/regression) per repo.",
-            "If diffs are missing, say so explicitly.",
+            "If diffs are missing or patch_truncated is true, say so explicitly.",
             "Write the report in Chinese.",
         ],
     }
@@ -242,12 +270,15 @@ def render_fallback_markdown(
                     status = file_item.get("status", "")
                     additions = file_item.get("additions", 0)
                     deletions = file_item.get("deletions", 0)
+                    truncated = file_item.get("patch_truncated")
                     lines.append(f"    - {status}: {filename} (+{additions}/-{deletions})")
                     patch = (file_item.get("patch") or "").strip()
                     if patch:
                         lines.append("      ```diff")
                         lines.extend([f"      {line}" for line in patch.splitlines()])
                         lines.append("      ```")
+                    if truncated:
+                        lines.append("      - Diff truncated to fit prompt budget.")
     if errors:
         lines.append("")
         lines.append("## Notes")
@@ -283,6 +314,7 @@ def main() -> None:
     max_commits = int(cfg["github"].get("max_commits_per_repo", 8))
     max_files = int(cfg["github"].get("max_files_per_commit", 6))
     max_diff_chars = int(cfg["github"].get("max_diff_chars", 1200))
+    max_total_diff_chars = int(cfg["github"].get("max_total_diff_chars", 0))
     for repo in cfg["github"].get("repos", []):
         try:
             repo_commits = fetch_github_commits(repo, since_iso, token=gh_token)[:max_commits]
@@ -302,6 +334,10 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001 - want a single fallback path
             commits[repo] = []
             errors.append(f"GitHub fetch failed for {repo}: {exc}")
+
+    truncated_count = limit_diff_budget(commits, max_total_diff_chars)
+    if truncated_count:
+        errors.append("Diff content truncated to fit prompt budget.")
 
     report = ""
     if os.environ.get("OPENROUTER_API_KEY"):
