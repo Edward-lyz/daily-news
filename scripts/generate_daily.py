@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import time
 from typing import Any, Dict, List, Tuple
 
 import feedparser
@@ -165,7 +166,7 @@ def fetch_commit_detail(
     }
 
 
-def openrouter_summarize(prompt: str, model: str) -> str:
+def openrouter_summarize(prompt: str, model: str, retry_max: int, retry_base_seconds: int) -> str:
     key = os.environ["OPENROUTER_API_KEY"]
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -183,12 +184,24 @@ def openrouter_summarize(prompt: str, model: str) -> str:
         ],
         "temperature": 0.2,
     }
-    response = requests.post(url, headers=headers, json=body, timeout=60)
-    if not response.ok:
+    attempts = max(1, retry_max)
+    for attempt in range(attempts):
+        response = requests.post(url, headers=headers, json=body, timeout=60)
+        if response.ok:
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
         detail = truncate_text(response.text.strip(), 2000)
+        retriable = response.status_code in {429, 500, 502, 503, 504}
+        if retriable and attempt < attempts - 1:
+            retry_after = response.headers.get("Retry-After", "").strip()
+            if retry_after.isdigit():
+                delay = int(retry_after)
+            else:
+                delay = retry_base_seconds * (2**attempt)
+            time.sleep(min(delay, 60))
+            continue
         raise RuntimeError(f"OpenRouter {response.status_code} {response.reason}: {detail}")
-    data = response.json()
-    return data["choices"][0]["message"]["content"]
+    raise RuntimeError("OpenRouter summarize failed: retry budget exhausted.")
 
 
 def build_prompt(date_str: str, papers: List[Dict[str, Any]], commits: Dict[str, List[Dict[str, Any]]]) -> str:
@@ -343,7 +356,18 @@ def main() -> None:
     if os.environ.get("OPENROUTER_API_KEY"):
         try:
             prompt = build_prompt(date_str, papers, commits)
-            report = openrouter_summarize(prompt, cfg["openrouter"].get("model", "openrouter/auto"))
+            models = cfg.get("openrouter", {}).get("models")
+            if not models:
+                models = [cfg.get("openrouter", {}).get("model", "openrouter/auto")]
+            retry_max = int(cfg["openrouter"].get("retry_max", 3))
+            retry_base_seconds = int(cfg["openrouter"].get("retry_base_seconds", 10))
+            for model in models:
+                try:
+                    report = openrouter_summarize(prompt, model, retry_max, retry_base_seconds)
+                    if report:
+                        break
+                except Exception as exc:  # noqa: BLE001 - want a single fallback path
+                    errors.append(f"OpenRouter summarize failed for {model}: {exc}")
         except Exception as exc:  # noqa: BLE001 - want a single fallback path
             errors.append(f"OpenRouter summarize failed: {exc}")
 
