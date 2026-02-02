@@ -6,218 +6,87 @@
 ---
 
 ## 最新解读 (2026-02-01)
-## 摘要
-
-今日无新论文。主要更新集中在三个核心推理框架：
-
-- **FlashInfer**: 回退了 Nemotron 支持和非门控激活类型，简化 MoE 实现；跳过 SM110 (Thor) 设备上的 trtllm_alltoall 测试
-- **SGLang**: Diffusion 引擎新增通用注意力后端配置接口；优化 VLM DP 注意力、RoPE 索引和自定义 AllReduce；修复多个 VLM/LoRA 相关 bug
-- **vLLM**: 新增 Step-3.5-Flash 模型支持（含 MTP 推测解码）；修复 prefix cache 命中率 bug；新增 unpermute-aware MoE LoRA 路径
+- **FlashInfer**：本日提交集中于 **API 重构**（将 `ActivationType` 替换为 `GatedActType`、去除 `enum_type`、修改 `useShuffledMatrix` 为 `useShuffledMatrixA`），并对 **DeepSeek‑V3 路由**、**TRT‑LLM 测试**、**CUDA 兼容性** 进行修复。  
+- **SGLang**：主要改动包括 **日志概率处理**、**Docker/ROCM 环境变量清理**、**Disaggregation 元数据校验**、**注意力后端配置**、**RoPE 计算优化** 等，提升了 **可靠性** 与 **可配置性**。  
+- **vLLM**：本日重点是 **GLM‑4 工具解析器**、**Step‑3.5 模型支持**、**前缀缓存 bug 修复**、**Fused MoE LoRA 反置**、**Spec‑decode 与结构化输出** 等，显著扩展模型覆盖面并优化性能。  
+- 新建 **Issue**：FlashInfer（FP4 KV cache 支持请求）、SGLang（文档导出、GPU 兼容性、Diffusion Router 等）以及 vLLM（KV‑Cache CPU on‑loading、GLM‑4 LoRA、模型加载错误等）均在本日提出，涉及 **兼容性**、**功能缺失** 与 **性能瓶颈**。
 
 ---
 
 ## 具体内容分析
 
-### flashinfer-ai/flashinfer
+### 1. FlashInfer (https://github.com/flashinfer-ai/flashinfer)
 
-#### 关键提交
+| 提交 | 关键文件/改动 | 主要内容 | 影响评估 |
+|------|---------------|----------|----------|
+| **5d5e164** (Skip trtllm_alltoall tests on Thor) | `tests/comm/test_trtllm_alltoall.py` | 为 SM110（Thor）设备添加 `pytest.mark.skipif`，防止测试卡死。 | **风险低**，仅影响 CI/测试，不影响用户代码。 |
+| **87a45d1** (Revert fused MoE non‑gated support) | `benchmarks/bench_trtllm_gen_fused_moe_autotuner.py`、`benchmarks/routines/flashinfer_benchmark_utils.py`、`benchmarks/routines/moe.py` | 移除对 `ActivationType` 的非门控实现，改用 `GatedActType`，删除 `enum_type` 辅助函数，更新 CLI 参数 `--gated_act`。 | **API 破坏**：`ActivationType` 被删除，用户需迁移到 `GatedActType`（`SwiGlu`/`GeGlu`）。提升代码整洁度，避免误用。 |
+| **f61fa8d** (Docker CI tags update) | `ci/docker-tags.yml` | CI 镜像标签更新至 `20260131-a52eff1`。 | **影响极小**，仅 CI 环境。 |
+| **csrc/trtllm_batched_gemm_runner.cu** | `csrc/trtllm_batched_gemm_runner.cu` | 将 `useShuffledMatrix` 重命名为 `useShuffledMatrixA`，删除对 `eltwiseActType` 的比较。 | **兼容性风险**：旧二进制可能因字段名不匹配而失效。 |
+| **csrc/trtllm_fused_moe_kernel_launcher.cu** | `csrc/trtllm_fused_moe_kernel_launcher.cu` | 使用 `GatedActType` 替代 `ActivationType`，默认改为 `SwiGlu`。 | 同上，API 破坏。 |
+| **csrc/trtllm_fused_moe_routing_deepseek.cu** | `csrc/trtllm_fused_moe_routing_deepseek.cu` | 将 DeepSeek‑V3 的 `topK` 上限从 22 降至 8，统一常量命名。 | **功能回退**：高 `topK` 场景需自行实现或等待后续支持。 |
+| **csrc/trtllm_fused_moe_runner.cu** | `csrc/trtllm_fused_moe_runner.cu` | 同上，检查 `topK <= 8`，`topkGroup <= 4`。 | 同上。 |
+| **csrc/trtllm_fused_moe/routingkernel.h** | `include/flashinfer/trtllm/fused_moe/RoutingKernel.h` | 移除模板参数 `MaxNumTopExperts_`，改为直接使用 `MaxNumTopExperts` 常量。 | **内部实现简化**，对外 API 未变。 |
+| **include/flashinfer/trtllm/fused_moe/runner.h** | `include/flashinfer/trtllm/fused_moe/runner.h` | 将 `ActivationType` 替换为 `GatedActType`，并提供 `serializeGatedActType`。 | **API 破坏**，需更新调用方。 |
+| **flashinfer/__init__.py**、**flashinfer/fused_moe/__init__.py**、**flashinfer/fused_moe/core.py** | 导出 `GatedActType`，删除 `ActivationType`，在 `core.py` 添加 `GatedActType` 定义并简化 `is_gated_act_gemm` 逻辑。 | **向后兼容性**：旧 `ActivationType` 导入将失效。 |
+| **tests/moe/** | `test_dpsk_fused_moe_fp8.py`、`test_trtllm_gen_fused_moe.py` | 测试代码同步改为使用 `GatedActType`，删除 `is_gated_activation` 辅助函数。 | **测试更新**，确保 CI 通过。 |
 
-**1. Revert "feat: Support Fused MoE non gated Relu2 NVFP4 & FP8 and support Nemotron"** ([#2451](https://github.com/flashinfer-ai/flashinfer/commit/87a45d131dc6518493718e20086cc665ed46da4f))
+**总体评估**  
+- **正面**：统一了门控激活的命名（`GatedActType`），去除冗余 `enum_type`，提升代码可维护性；对 DeepSeek‑V3 路由上限的限制防止潜在越界错误。  
+- **负面**：**API 破坏** 明显，所有依赖 `ActivationType`、`useShuffledMatrix`、`eltwiseActType` 的项目需要迁移。若未及时更新，可能导致运行时错误。  
+- **回归风险**：中等，主要集中在旧版二进制兼容性和用户代码迁移。
 
-重大回退，删除了 610 行代码，新增 304 行。主要变更：
-
-- **API 变更**: `ActivationType` → `GatedActType`，仅保留 `SwiGlu` 和 `GeGlu`
-```python
-# flashinfer/fused_moe/core.py
-class GatedActType(IntEnum):
-    SwiGlu = 0
-    GeGlu = 1
-```
-
-- **移除 Nemotron 支持**: 删除 `NumNemotronExperts = 512`，`MaxNumTopExperts` 从 22 降至 8
-```cpp
-// csrc/trtllm_fused_moe_routing_deepseek.cu
--static constexpr int NumNemotronExperts = 512;
--static constexpr int MaxSupportedTopExperts = 22;
-+static constexpr int MaxNumTopExperts = 8;
-```
-
-- **DeepSeek 路由限制收紧**: topK 从 ≤22 改为 ≤8
-```cpp
-// csrc/trtllm_fused_moe_runner.cu
--FLASHINFER_CHECK(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
-+FLASHINFER_CHECK(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
-```
-
-**评估**: 🔴 **高风险** - 破坏性 API 变更，影响依赖 Nemotron 和非门控激活的用户。建议关注后续是否有替代方案。
-
-**2. Skip trtllm_alltoall tests on Thor** ([#2448](https://github.com/flashinfer-ai/flashinfer/commit/5d5e164c44e4332a92e2526ba01f5893d5e85353))
-
-```python
-# tests/comm/test_trtllm_alltoall.py
-pytestmark = pytest.mark.skipif(
-    torch.cuda.is_available()
-    and get_compute_capability(torch.device("cuda:0"))[0] == 11,
-    reason="Tests hang indefinitely on SM110 (Thor) devices",
-)
-```
-
-**评估**: 🟡 **中风险** - 暴露 SM110 (Thor) 架构存在兼容性问题，测试被跳过而非修复。
+**相关 Issue**  
+- **#2458** – “Support FP4 kv cache in trtllm‑gen fmha kernel”。用户在使用 FP4 KV 缓存时遇到 `Unsupported Kv data type: E2M1` 错误，表明当前 FMHA 内核仍不支持 FP4。该 Issue 仍未关闭，可能在后续版本中得到实现。
 
 ---
 
-### sgl-project/sglang
+### 2. SGLang (https://github.com/sgl-project/sglang)
 
-#### 关键提交
+| 提交 | 关键文件/改动 | 主要内容 | 影响评估 |
+|------|---------------|----------|----------|
+| **ab8b99e** (Refine logprob logic) | `python/sglang/srt/managers/scheduler.py` | 当 `logprob_start_len == -1` 且 `return_logprob=True` 且 `token_ids_logprob` 为 `None` 时，默认返回输出 token 的 logprob。 | **功能改进**：避免在未显式指定 `logprob_start_len` 时返回空 logprob，提升 API 友好性。 |
+| **ea04bc1** (ROCM aiter version fix) | `docker/rocm.Dockerfile`、`python/sglang/multimodal_gen/runtime/server_args.py` | 清除 `SETUPTOOLS_SCM_PRETEND_VERSION` 环境变量防止 AITER 继承 SGLang 版本号；在 `server_args.py` 中仅在 pip 安装阶段传递该变量。 | **兼容性提升**：解决 AITER 在 ROCM 镜像中版本冲突的问题。 |
+| **8ed35df** (bootstrap_room validation) | `python/sglang/srt/disaggregation/decode.py`、`python/sglang/srt/disaggregation/utils.py` | 为 `DecodeRequest` 增加 `_commit_transfer_to_req` 返回值，加入 `bootstrap_room` 校验，检测上下文损坏。 | **可靠性提升**：提前捕获元数据不一致，防止后续解码错误。 |
+| **c84cd4b** (VAELoader component name fix) | `python/sglang/multimodal_gen/runtime/loader/vae_loader.py` | 修正缺失的组件名称字段。 | **小幅修复**，不影响功能。 |
+| **977096a** (Attention backend config) | 多个文件（`server_args.py`、`attention/backends/sliding_tile_attn.py`、文档） | 引入通用注意力后端配置选项，支持在 ServerArgs 中显式指定后端。 | **可配置性提升**，对用户无感知的默认行为保持不变。 |
+| **d11ccc0** (VLM dp attention double‑reduce fix) | `python/sglang/srt/layers/attention/vision.py`、`models/kimi_k25.py`、测试文件 | 删除冗余 `reduce`，修正注意力计算错误。 | **性能提升**，避免不必要的同步。 |
+| **4ea4f2a** (GLM4v RoPE index optimization) | `benchmark/bench_rope/benchmark_rope_index.py`、`layers/rotary_embedding.py` | 新增基准脚本并在实现中使用更高效的索引计算。 | **性能提升**，对 GLM4v 相关模型有直接收益。 |
+| **0fe2825** (NPU return routed experts) | `hardware_backend/npu/moe/topk.py`、`layers/moe/topk.py` | 在 NPU 后端新增 `enable_return_routed_experts` 标志。 | **功能扩展**，支持 NPU 场景下的路由信息返回。 |
+| **27bec34** (ascend disaggregation param adaptation) | `disaggregation/ascend/conn.py`、`transfer_engine.py`、`common/conn.py` | 增加 `decode_enable_fake_auto` 参数适配。 | **兼容性提升**，适配新硬件特性。 |
+| **d9050b4** (reset evict swa status) | `managers/schedule_batch.py` | 在 `retract` 时重置 `evict_swa` 状态。 | **行为修正**，防止错误的 SWA 撤回。 |
+| **f61fa8d** (Docker CI tag update) | `ci/docker-tags.yml` | 同 FlashInfer，更新 CI 镜像标签。 | **CI 维护**，影响极小。 |
 
-**1. [diffusion] cli: introduce generic attention backend configuration** ([#18036](https://github.com/sgl-project/sglang/commit/977096ae03ac4d4148842ad7a9a052c8258bf790))
+**总体评估**  
+- **正面**：大量 **错误修复**（日志概率、注意力双 reduce、bootstrap 验证）以及 **配置可扩展性**（注意力后端、ROCM 环境、NPU 支持），提升了系统的 **鲁棒性** 与 **跨平台兼容性**。  
+- **负面**：改动主要在内部实现，**API 兼容性** 基本保持；唯一需要用户关注的是 **`bootstrap_room`** 新增校验，若旧代码未提供该字段可能触发异常。  
+- **回归风险**：低至中等，主要在 **ROCM Docker** 环境和 **NPU** 代码路径，普通 CPU/GPU 使用者不受影响。
 
-新增 `--attention-backend-config` 参数，支持 JSON/YAML/键值对格式配置：
+**相关 Issue**（均在 2026‑02‑01 提出）  
+| Repo | Issue | 影响 |
+|------|-------|------|
+| SGLang | **#18081** – “Markdown/Notebook‑friendly 文档导出” | 文档体系改造需求，若未实现会影响 downstream 文档集成。 |
+| SGLang | **#18080** – “GLM‑4.7‑Flash 在 Blackwell RTX PRO 6000 上加载失败” | 共享内存不足导致启动失败，提示需要调节 block size。 |
+| SGLang | **#18079** – “Diffusion Router 实现” | 计划中的路由器功能，当前仅需求阶段。 |
+| SGLang | **#18078** – “实现 update_weights_from_disk for SGLang‑D” | 动态权重更新需求，未实现会限制 RL/微调工作流。 |
+| SGLang | **#18077** – “GLM‑Image 推理基准与优化” | 评估与优化需求，影响性能对比。 |
+| SGLang | **#18074** – “Harmony 编码加载失败” | 离线环境缺失 vocab 下载，需提供离线包。 |
+| SGLang | **#18072** – “RVV Attention Backend” | 新硬件后端需求，暂无实现。 |
+| SGLang | **#18071** – “SM110: NVFP4 量化不支持” | 与 FlashInfer 类似的硬件兼容性问题。 |
 
-```python
-# python/sglang/multimodal_gen/runtime/server_args.py
-parser.add_argument(
-    "--attention-backend-config",
-    type=str,
-    help="Configuration for the attention backend. Can be a JSON string, "
-         "a path to a JSON/YAML file, or key=value pairs.",
-)
-```
-
-依赖更新：新增 `addict` 库。
-
-**评估**: 🟢 **正向改进** - 统一了注意力后端配置接口，提升可扩展性。
-
-**2. fix: avoid double reduce in VLM dp attention** ([#17991](https://github.com/sgl-project/sglang/commit/d11ccc0a0aa86baa465072e1969b6fc9438cc04a))
-
-修复 VLM 数据并行注意力中的双重 reduce 问题：
-
-```python
-# python/sglang/srt/layers/attention/vision.py
-# 移除了多余的 reduce 操作
-```
-
-**评估**: 🟢 **性能修复** - 避免冗余通信，提升 VLM DP 效率。
-
-**3. Optimize custom-all-reduce** ([#17674](https://github.com/sgl-project/sglang/commit/afebb7ab7893869ec8cf7ed6dd6f06981bc8ccef))
-
-```cpp
-// sgl-kernel/csrc/allreduce/custom_all_reduce.cuh
-// 优化了自定义 allreduce 内核实现
-```
-
-**评估**: 🟢 **性能优化** - 核心通信原语优化，影响全框架性能。
-
-**4. [VLM] Optimize get_rope_index for GLM4v** ([#17420](https://github.com/sgl-project/sglang/commit/4ea4f2a20c4b7d6d78220ac5e1c80aa1d288c9fb))
-
-重构 RoPE 索引计算，新增 benchmark：
-
-```python
-# python/sglang/srt/layers/rotary_embedding.py
-# 优化 GLM4v 的 get_rope_index 实现
-```
-
-**评估**: 🟢 **性能优化** - 针对 GLM4v 的特定优化。
+> **注意**：上述 Issue 的正文均被标记为 `body_truncated: true`，因此具体细节未完整展示。
 
 ---
 
-### vllm-project/vllm
+### 3. vLLM (https://github.com/vllm-project/vllm)
 
-#### 关键提交
-
-**1. [Models] Step-3.5-Flash** ([#33523](https://github.com/vllm-project/vllm/commit/c3b40dc3e74dc0f552f76a01ae38b4f1385ad0af))
-
-重大新模型支持，新增 3107 行代码：
-
-- 新增 `vllm/model_executor/models/step3p5.py` (894 行) 和 `step3p5_mtp.py` (315 行)
-- 新增 `Step3p5ReasoningParser` 和 `Step3p5ToolParser`
-- 新增 `SwiGLU2` 激活函数支持
-
-```python
-# vllm/model_executor/layers/activation.py
-class SwiGLU2(nn.Module):
-    """SwiGLU with squared SiLU activation for Step-3.5-Flash"""
-```
-
-**评估**: 🟢 **重要功能** - 新模型支持，含 MTP 推测解码和工具调用解析。
-
-**2. [Fix] prefix cache hit rate == 0 bug with gpt-oss style models** ([#33524](https://github.com/vllm-project/vllm/commit/a01ef3fa51a0312914ca60ecbab2bc45aa43e32c))
-
-修复 gpt-oss 风格模型的 prefix cache 命中率问题：
-
-```python
-# vllm/v1/core/kv_cache_coordinator.py
-# 修复了 prefix cache 命中率计算逻辑
-```
-
-**评估**: 🟢 **关键修复** - 影响 prefix cache 功能的正确性。
-
-**3. Add unpermute-aware fused MoE LoRA path** ([#32655](https://github.com/vllm-project/vllm/commit/7320ca3942d008a59c24da3305c81810cb586c9d))
-
-新增支持 unpermute 感知的 MoE LoRA 路径：
-
-```python
-# vllm/lora/ops/triton_ops/fused_moe_lora_op.py
-# 新增 unpermute-aware 路径实现
-```
-
-**评估**: 🟢 **功能增强** - 提升 MoE LoRA 的兼容性和性能。
-
-**4. [ModelRunner V2] Support spec decode with structured outputs** ([#33374](https://github.com/vllm-project/vllm/commit/cf0a99f84db5385722e78dc4d7ba76075545a858))
-
-```python
-# vllm/v1/worker/gpu/spec_decode/utils.py (新增)
-# 支持推测解码与结构化输出结合
-```
-
-**评估**: 🟢 **功能增强** - 扩展推测解码的应用场景。
-
----
-
-## Issues 摘要
-
-### flashinfer-ai/flashinfer
-
-| Issue | 描述 | 影响 |
-|-------|------|------|
-| [#2458](https://github.com/flashinfer-ai/flashinfer/issues/2458) | 请求支持 FP4 KV cache in trtllm-gen fmha kernel | 功能请求，当前报错 `Unsupported Kv data type: E2M1` |
-
-### sgl-project/sglang
-
-| Issue | 描述 | 影响 |
-|-------|------|------|
-| [#18080](https://github.com/sgl-project/sglang/issues/18080) | GLM-4.7-Flash 在 Blackwell RTX PRO 6000 上加载失败 | 🔴 Triton 共享内存超限 |
-| [#18071](https://github.com/sgl-project/sglang/issues/18071) | SM110 (Thor) 不支持 NVFP4 量化 | 🔴 Jetson Thor 平台兼容性问题 |
-| [#18072](https://github.com/sgl-project/sglang/issues/18072) | 请求添加 RISC-V RVV 注意力后端 | 功能请求，扩展 CPU 推理支持 |
-| [#18079](https://github.com/sgl-project/sglang/issues/18079) | 请求实现 Diffusion Router | 架构改进，支持 RL rollout |
-
-### vllm-project/vllm
-
-| Issue | 描述 | 影响 |
-|-------|------|------|
-| [#33526](https://github.com/vllm-project/vllm/issues/33526) | RFC: 渐进式 KV Cache CPU 加载 | 架构改进，减少 head-of-line blocking |
-| [#33519](https://github.com/vllm-project/vllm/issues/33519) | GLM4.7-flash 无法加载 LoRA 适配器 | 🔴 MoE LoRA 兼容性问题 |
-| [#33512](https://github.com/vllm-project/vllm/issues/33512) | Responses API reasoning_tokens 始终为 0 | 🔴 计费/遥测数据不准确 |
-| [#33497](https://github.com/vllm-project/vllm/issues/33497) | DeepSeek-V3.2 + deepseek_mtp 接受率低 | 🟡 推测解码效率问题 |
-
----
-
-## 总结
-
-### FlashInfer: MoE 实现简化与 API 收紧
-
-- **回退 Nemotron 支持**: `ActivationType` → `GatedActType`，仅保留 SwiGlu/GeGlu，topK 限制从 22 降至 8 ([#2451](https://github.com/flashinfer-ai/flashinfer/commit/87a45d131dc6518493718e20086cc665ed46da4f))
-- **SM110 兼容性问题**: Thor 设备上 trtllm_alltoall 测试挂起，被跳过而非修复 ([#2448](https://github.com/flashinfer-ai/flashinfer/commit/5d5e164c44e4332a92e2526ba01f5893d5e85353))
-
-### SGLang: Diffusion 引擎成熟化 + VLM 优化
-
-- **通用注意力后端配置**: 新增 `--attention-backend-config` CLI 参数，支持 JSON/YAML/k=v 格式 ([#18036](https://github.com/sgl-project/sglang/commit/977096ae03ac4d4148842ad7a9a052c8258bf790))
-- **VLM DP 修复**: 避免双重 reduce，优化 GLM4v RoPE 索引 ([#17991](https://github.com/sgl-project/sglang/commit/d11ccc0a0aa86baa465072e1969b6fc9438cc04a), [#17420](https://github.com/sgl-project/sglang/commit/4ea4f2a20c4b7d6d78220ac5e1c80aa1d288c9fb))
-- **自定义 AllReduce 优化**: 核心通信原语性能提升 ([#17674](https://github.com/sgl-project/sglang/commit/afebb7ab7893869ec8cf7ed6dd6f06981bc8ccef))
-
-### vLLM: 新模型支持 + 关键 Bug 修复
-
-- **Step-3.5-Flash**: 完整模型支持，含 MTP 推测解码、SwiGLU2 激活、工具调用解析 ([#33523](https://github.com/vllm-project/vllm/commit/c3b40dc3e74dc0f552f76a01ae38b4f1385ad0af))
-- **Prefix Cache 修复**: gpt-oss 风格模型命中率从 0 恢复正常 ([#33524](https://github.com/vllm-project/vllm/commit/a01ef3fa51a0312914ca60ecbab2bc45aa43e32c))
-- **MoE LoRA 增强**: 新增 unpermute-aware 路径 ([#32655](https://github.com/vllm-project/vllm/commit/7320ca3942d008a59c24da3305c81810cb586c9d))
-- **ModelRunner V2 优化**: 支持推测解码 + 结构化输出，代码简化 ([#33374](https://github.com/vllm-project/vllm/commit/cf0a99f84db5385722e78dc4d7ba76075545a858), [#33467](https://github.com/vllm-project/vllm/commit/e535d90debb39e8462cd39004fb7e0d9ded10740))
+| 提交 | 关键文件/改动 | 主要内容 | 影响评估 |
+|------|---------------|----------|----------|
+| **7c03643** (GLM‑4 tool parser) | `tests/tool_parsers/test_glm4_moe_tool_parser.py`、`vllm/tool_parsers/glm4_moe_tool_parser.py` | 完全重写 GLM‑4 MoE 工具解析器，新增 336 行测试，提升对 GLM‑4‑MoE 的工具调用支持。 | **功能扩展**：用户可在 OpenAI‑compatible 接口中使用 GLM‑4‑MoE 的 tool 调用。 |
+| **318b120** (Remove CT Model) | `tests/weight_loading/models.txt` | 删除 CT（ChatT）模型条目。 | **影响极小**，仅 CI 测试列表变更。 |
+| **c3b40dc** (Step‑3.5‑Flash) | 多文件（模型注册、激活层、Step‑3.5 代码、tool parser） | 新增 Step‑3.5 大模型（包括 `step3p5` 与 `step3p5_mtp`），实现对应激活层、推理路径、工具解析器。 | **重大功能**：支持最新的 Step‑3.5 系列模型，吸引新用户。 |
+| **a01ef3f** (prefix cache hit rate bug) | `tests/v1/core/test_prefix_caching.py`、`v1/core/kv_cache_coordinator.py` | 修复在 GPT‑OSS 风格模型上前缀缓存命中率为 0 的错误。 | **性能提升**，避免误报缓存失效。 |
+| **7320ca3** (Unpermute‑aware fused MoE LoRA) | `benchmarks/kernels/benchmark_lora.py`、`tests/lora/test_fused_moe_lora_kernel.py`、`lora/layers/fused_moe.py`、`lora/ops/triton_ops/fused_moe_lora_op.py`、`punica_wrapper/*` | 为 Fused MoE LoRA 添加 **unpermute‑aware** 实现，提升 LoRA 与 MoE 组合的效率。 | **性能提升**，对 LoRA‑MoE 场景有显著加速。 |
+| **cf0a99f** (Spec‑decode with structured outputs) | `v1/worker/gpu/input_batch.py`、`v1/worker/gpu/model_runner.py`、`v1/worker/gpu/spec_decode/utils.py` | 为 Spec‑decode 引入结构化输出支持（如 tool calls、reasoning），并添加实用工具函数。 | **功能扩展**：Spec‑decode 现在可直接返回结构化结果，提升 API 表达力。 |
+| **e535d90** (Misc simplifications) | 多个 `v1/worker/gpu/*` 文件 | 代码路径简化、去除冗余、优化异步/图形化工具、降低内存占用。 | **维护性提升**，对用户行为无感知。 |
+| **0b225fb** (Skip target model mm emb in draft) | `
