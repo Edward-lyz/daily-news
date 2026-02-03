@@ -4,7 +4,6 @@ import os
 import time
 from typing import Any, Dict, List, Tuple
 
-import feedparser
 import requests
 import yaml
 
@@ -25,10 +24,6 @@ def date_range_for_yesterday() -> Tuple[
     )
     end = start + datetime.timedelta(days=1)
     return y_date, start, end
-
-
-def normalize_space(text: str) -> str:
-    return " ".join(text.split())
 
 
 def truncate_text(text: str, max_chars: int, suffix: str = "...") -> str:
@@ -95,47 +90,6 @@ def limit_issue_budget(
                 remaining -= len(body)
     return truncated
 
-
-def fetch_arxiv(query: str, max_results: int = 50) -> List[Any]:
-    url = "https://export.arxiv.org/api/query"
-    params = {
-        "search_query": query,
-        "start": 0,
-        "max_results": max_results,
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    }
-    response = requests.get(url, params=params, timeout=30)
-    response.raise_for_status()
-    feed = feedparser.parse(response.text)
-    return feed.entries
-
-
-def entry_date(entry: Any) -> datetime.date:
-    parsed = getattr(entry, "updated_parsed", None) or getattr(
-        entry, "published_parsed", None
-    )
-    if not parsed:
-        return datetime.datetime.now(tz=UTC).date()
-    return datetime.datetime(*parsed[:6], tzinfo=UTC).date()
-
-
-def filter_yesterday_arxiv(
-    entries: List[Any], y_date: datetime.date
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for entry in entries:
-        if entry_date(entry) != y_date:
-            continue
-        out.append(
-            {
-                "title": normalize_space(entry.title),
-                "link": entry.link,
-                "authors": [a.name for a in getattr(entry, "authors", [])],
-                "summary": normalize_space(entry.summary),
-            }
-        )
-    return out
 
 
 def fetch_github_commits(
@@ -289,136 +243,105 @@ def openrouter_summarize(
     raise RuntimeError("OpenRouter summarize failed: retry budget exhausted.")
 
 
-def build_prompt(
+def build_repo_prompt(
     date_str: str,
-    papers: List[Dict[str, Any]],
-    commits: Dict[str, List[Dict[str, Any]]],
-    issues: Dict[str, List[Dict[str, Any]]],
+    repo: str,
+    commits: List[Dict[str, Any]],
+    issues: List[Dict[str, Any]],
 ) -> str:
     payload = {
         "date": date_str,
-        "papers": papers,
+        "repo": repo,
         "commits": commits,
         "issues": issues,
         "requirements": [
-            "Return a Markdown report with three top-level sections: 摘要, 具体内容分析, 总结 (use ## headings).",
-            "For papers: include a 1-line why it matters (AI infra angle).",
-            "For repos: use file-level diffs in commits[*].files[*].patch to summarize changes.",
-            "For repos: include a brief evaluation (impact/risk/regression) per repo.",
-            "For issues: summarize newly created issues per repo and explain potential impact.",
-            "If diffs are missing or patch_truncated is true, say so explicitly.",
-            "If issue body is missing or body_truncated is true, say so explicitly.",
-            "Write the report in Chinese.",
-            "总结仓库的改动时，需要在你说出的每个总结的点上都附上对应的 github 的 PR 链接，方便跳转。没有 PR 链接就给出 commit 名称。",
-            "总结不能过于潦草，需要严谨地指出，哪里组件/模块改动了什么具体细节，最好有简短的代码片段。",
-            "开头必须是：今日的 AI Infra 的新闻如下。"
+            "只输出 Markdown，不要顶层标题。",
+            "先写提交，再写 Issues；用清晰的短句。",
+            "总结仓库改动时，每个要点必须附上对应的 GitHub PR 链接；没有 PR 链接就给出 commit 短 SHA，并附上 commit URL。",
+            "涉及文件改动时，必须指出具体模块/文件名，必要时给简短代码片段。",
+            "如果 diff 缺失或 patch_truncated 为 true，需要明确说明。",
+            "如果 issue body 缺失或 body_truncated 为 true，需要明确说明。",
+            "输出中文。专业术语保留英文。",
         ],
     }
     return json.dumps(payload, ensure_ascii=True)
 
 
+def build_global_prompt(
+    date_str: str,
+    repo_summaries: List[Dict[str, str]],
+    repos_without_updates: List[str],
+) -> str:
+    payload = {
+        "date": date_str,
+        "repo_summaries": repo_summaries,
+        "repos_without_updates": repos_without_updates,
+        "requirements": [
+            "只输出 JSON，包含 summary 和 conclusion 两个字段，字段值为 Markdown 字符串。",
+            "summary 用 4-6 句概括关键变化与影响。",
+            "conclusion 需要给出风险/回归/待关注点（如有）。",
+            "不要输出 '今日的 AI Infra 的新闻如下。' 这行。",
+            "输出中文。专业术语保留英文。",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=True)
+
+
+def render_repo_fallback(
+    repo: str,
+    commits: List[Dict[str, Any]],
+    issues: List[Dict[str, Any]],
+) -> str:
+    if not commits and not issues:
+        return "昨日无更新。"
+    lines: List[str] = []
+    if commits:
+        lines.append("提交：")
+        for item in commits:
+            sha = item.get("sha", "")
+            msg = item.get("msg", "")
+            url = item.get("url", "")
+            lines.append(f"- {msg} [`{sha}`]({url})")
+            files = item.get("files") or []
+            if files:
+                names = ", ".join([f.get("filename", "") for f in files if f.get("filename")])
+                if names:
+                    lines.append(f"- 受影响文件: {names}")
+            if item.get("truncated_files"):
+                lines.append("- 文件列表已截断。")
+    if issues:
+        lines.append("Issues：")
+        for item in issues:
+            title = item.get("title", "").strip()
+            url = item.get("url", "").strip()
+            lines.append(f"- {title} ({url})")
+            if item.get("body_truncated"):
+                lines.append("- Issue 内容已截断。")
+    return "\n".join(lines)
+
+
 def render_fallback_markdown(
     date_str: str,
-    papers: List[Dict[str, Any]],
-    commits: Dict[str, List[Dict[str, Any]]],
-    issues: Dict[str, List[Dict[str, Any]]],
+    repo_sections: Dict[str, str],
+    repos_without_updates: List[str],
     errors: List[str],
 ) -> str:
     lines: List[str] = []
-    lines.append(f"# AI Infra 日报 - {date_str}")
+    lines.append("今日的 AI Infra 的新闻如下。")
     lines.append("")
     lines.append("## 摘要")
-    lines.append("模型摘要不可用，以下为原始数据整理。")
+    if errors:
+        lines.append("模型摘要不可用，以下为原始数据整理。")
+    else:
+        lines.append("模型摘要不可用，以下为原始数据整理。")
     lines.append("")
     lines.append("## 具体内容分析")
-    lines.append("### 论文")
-    if not papers:
-        lines.append("- 未找到符合日期过滤的论文。")
-    else:
-        for paper in papers:
-            title = paper.get("title", "").strip()
-            link = paper.get("link", "").strip()
-            authors = ", ".join(paper.get("authors", []))
-            summary = paper.get("summary", "").strip()
-            header = f"- [{title}]({link})"
-            if authors:
-                header += f" - {authors}"
-            lines.append(header)
-            if summary:
-                lines.append(f"  - {summary}")
-    lines.append("")
-    lines.append("### 代码提交")
-    if not commits:
-        lines.append("- 未配置仓库。")
-    else:
-        for repo, items in commits.items():
-            lines.append(f"#### {repo}")
-            if not items:
-                lines.append("- 时间窗口内无提交。")
-                continue
-            for item in items:
-                sha = item.get("sha", "")
-                msg = item.get("msg", "")
-                url = item.get("url", "")
-                author = item.get("author", "")
-                suffix = f" ({author})" if author else ""
-                lines.append(f"- [`{sha}`]({url}) {msg}{suffix}")
-                stats = item.get("stats") or {}
-                if stats:
-                    lines.append(
-                        f"  - Stats: +{stats.get('additions', 0)}/-{stats.get('deletions', 0)} "
-                        f"(total {stats.get('total', 0)})"
-                    )
-                files = item.get("files") or []
-                if not files:
-                    lines.append("  - 无法获取 diff。")
-                    continue
-                if item.get("truncated_files"):
-                    lines.append("  - 文件列表（截断）：")
-                else:
-                    lines.append("  - 文件列表：")
-                for file_item in files:
-                    filename = file_item.get("filename", "")
-                    status = file_item.get("status", "")
-                    additions = file_item.get("additions", 0)
-                    deletions = file_item.get("deletions", 0)
-                    truncated = file_item.get("patch_truncated")
-                    lines.append(
-                        f"    - {status}: {filename} (+{additions}/-{deletions})"
-                    )
-                    patch = (file_item.get("patch") or "").strip()
-                    if patch:
-                        lines.append("      ```diff")
-                        lines.extend([f"      {line}" for line in patch.splitlines()])
-                        lines.append("      ```")
-                    if truncated:
-                        lines.append("      - Diff 已截断以满足 prompt 预算。")
-    lines.append("")
-    lines.append("### 新增 Issues")
-    if not issues:
-        lines.append("- 未配置仓库。")
-    else:
-        for repo, items in issues.items():
-            lines.append(f"#### {repo}")
-            if not items:
-                lines.append("- 时间窗口内无新增 issue。")
-                continue
-            for item in items:
-                title = item.get("title", "").strip()
-                url = item.get("url", "").strip()
-                author = item.get("author", "")
-                comments = item.get("comments", 0)
-                header = f"- [{title}]({url})"
-                if author:
-                    header += f" ({author})"
-                if comments:
-                    header += f" - {comments} 条评论"
-                lines.append(header)
-                body = (item.get("body") or "").strip()
-                if body:
-                    lines.append(f"  - {body}")
-                if item.get("body_truncated"):
-                    lines.append("  - Issue 内容已截断以满足 prompt 预算。")
+    for repo, body in repo_sections.items():
+        lines.append(f"### {repo}")
+        if body:
+            lines.append(body)
+        else:
+            lines.append("昨日无更新。")
     lines.append("")
     lines.append("## 总结")
     if errors:
@@ -426,7 +349,46 @@ def render_fallback_markdown(
             lines.append(f"- {err}")
     else:
         lines.append(
-            f"- 论文: {len(papers)}; 仓库: {len(commits)}; Issues: {sum(len(v) for v in issues.values())}."
+            f"- 有更新的仓库: {len(repo_sections) - len(repos_without_updates)}; 无更新的仓库: {len(repos_without_updates)}."
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_report(
+    date_str: str,
+    summary: str,
+    conclusion: str,
+    repo_sections: Dict[str, str],
+    repos_without_updates: List[str],
+    errors: List[str],
+) -> str:
+    lines: List[str] = []
+    lines.append("今日的 AI Infra 的新闻如下。")
+    lines.append("")
+    lines.append("## 摘要")
+    if summary:
+        lines.append(summary.strip())
+    else:
+        lines.append("模型摘要不可用，以下为原始数据整理。")
+    lines.append("")
+    lines.append("## 具体内容分析")
+    for repo, body in repo_sections.items():
+        lines.append(f"### {repo}")
+        if body:
+            lines.append(body.strip())
+        else:
+            lines.append("昨日无更新。")
+    lines.append("")
+    lines.append("## 总结")
+    if conclusion:
+        lines.append(conclusion.strip())
+    elif errors:
+        for err in errors:
+            lines.append(f"- {err}")
+    else:
+        lines.append(
+            f"- 有更新的仓库: {len(repo_sections) - len(repos_without_updates)}; 无更新的仓库: {len(repos_without_updates)}."
         )
     lines.append("")
     return "\n".join(lines)
@@ -495,18 +457,6 @@ def main() -> None:
 
     errors: List[str] = []
 
-    try:
-        arxiv_entries = fetch_arxiv(
-            cfg["arxiv"]["query"], cfg["arxiv"].get("max_results", 50)
-        )
-    except Exception as exc:  # noqa: BLE001 - want a single fallback path
-        arxiv_entries = []
-        errors.append(f"arXiv fetch failed: {exc}")
-
-    papers = filter_yesterday_arxiv(arxiv_entries, y_date)[
-        : cfg["arxiv"].get("top_n", 15)
-    ]
-
     gh_token = os.environ.get("GITHUB_TOKEN")
     commits: Dict[str, List[Dict[str, Any]]] = {}
     max_commits = int(cfg["github"].get("max_commits_per_repo", 8))
@@ -569,29 +519,78 @@ def main() -> None:
     if issue_truncated_count:
         errors.append("Issue 内容已截断以满足 prompt 预算。")
 
-    report = ""
-    if os.environ.get("OPENROUTER_API_KEY"):
-        try:
-            prompt = build_prompt(date_str, papers, commits, issues)
-            models = cfg.get("openrouter", {}).get("models")
-            if not models:
-                models = [cfg.get("openrouter", {}).get("model", "openrouter/auto")]
-            retry_max = int(cfg["openrouter"].get("retry_max", 3))
-            retry_base_seconds = int(cfg["openrouter"].get("retry_base_seconds", 10))
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    models = cfg.get("openrouter", {}).get("models")
+    if not models:
+        models = [cfg.get("openrouter", {}).get("model", "openrouter/auto")]
+    retry_max = int(cfg["openrouter"].get("retry_max", 3))
+    retry_base_seconds = int(cfg["openrouter"].get("retry_base_seconds", 10))
+
+    repo_sections: Dict[str, str] = {}
+    repos_without_updates: List[str] = []
+    for repo in cfg["github"].get("repos", []):
+        repo_commits = commits.get(repo, [])
+        repo_issues = issues.get(repo, [])
+        if not repo_commits and not repo_issues:
+            repos_without_updates.append(repo)
+            repo_sections[repo] = "昨日无更新。"
+            continue
+        if openrouter_key:
+            prompt = build_repo_prompt(date_str, repo, repo_commits, repo_issues)
+            repo_summary = ""
             for model in models:
                 try:
-                    report = openrouter_summarize(
+                    repo_summary = openrouter_summarize(
                         prompt, model, retry_max, retry_base_seconds
                     )
-                    if report:
+                    if repo_summary:
                         break
                 except Exception as exc:  # noqa: BLE001 - want a single fallback path
-                    errors.append(f"OpenRouter summarize failed for {model}: {exc}")
-        except Exception as exc:  # noqa: BLE001 - want a single fallback path
-            errors.append(f"OpenRouter summarize failed: {exc}")
+                    errors.append(
+                        f"OpenRouter repo summarize failed for {repo} with {model}: {exc}"
+                    )
+            if repo_summary:
+                repo_sections[repo] = repo_summary.strip()
+                continue
+        repo_sections[repo] = render_repo_fallback(repo, repo_commits, repo_issues)
 
-    if not report:
-        report = render_fallback_markdown(date_str, papers, commits, issues, errors)
+    summary = ""
+    conclusion = ""
+    if openrouter_key:
+        repo_payload = [
+            {"repo": repo, "summary": body}
+            for repo, body in repo_sections.items()
+            if repo not in repos_without_updates
+        ]
+        prompt = build_global_prompt(date_str, repo_payload, repos_without_updates)
+        global_output = ""
+        for model in models:
+            try:
+                global_output = openrouter_summarize(
+                    prompt, model, retry_max, retry_base_seconds
+                )
+                if global_output:
+                    break
+            except Exception as exc:  # noqa: BLE001 - want a single fallback path
+                errors.append(
+                    f"OpenRouter global summarize failed for {model}: {exc}"
+                )
+        if global_output:
+            try:
+                data = json.loads(global_output)
+                summary = (data.get("summary") or "").strip()
+                conclusion = (data.get("conclusion") or "").strip()
+            except json.JSONDecodeError:
+                summary = global_output.strip()
+
+    if summary or conclusion:
+        report = render_report(
+            date_str, summary, conclusion, repo_sections, repos_without_updates, errors
+        )
+    else:
+        report = render_fallback_markdown(
+            date_str, repo_sections, repos_without_updates, errors
+        )
 
     os.makedirs("reports", exist_ok=True)
     out_path = os.path.join("reports", f"{date_str}.md")

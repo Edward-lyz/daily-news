@@ -1,9 +1,3 @@
-arxiv:
-  # Start broad; refine once the pipeline runs reliably.
-  query: '(cat:cs.LG OR cat:cs.DC OR cat:cs.PF) AND (GPU OR CUDA OR "distributed training" OR inference OR serving OR kernel)'
-  max_results: 80
-  top_n: 15
-
 github:
   repos:
     - "deepseek-ai/DeepGEMM"
@@ -25,9 +19,9 @@ github:
 openrouter:
   # Choose free/low-cost models to try in order.
   models:
+    - "openai/gpt-oss-120b:free"
     - "z-ai/glm-4.5-air:free"
     - "moonshotai/kimi-k2:free"
-    - "openai/gpt-oss-120b:free"
     - "deepseek/deepseek-r1-0528:free"
     - "qwen/qwen3-coder:free"
   retry_max: 3
