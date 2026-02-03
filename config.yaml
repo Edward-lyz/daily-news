@@ -13,7 +13,8 @@ github:
     - "Dao-AILab/flash-attention"
     - "sgl-project/sglang"
     - "vllm-project/vllm"
-  max_commits_per_repo: 16
+    - "NVIDIA/cutile-python"
+  max_commits_per_repo: 64
   max_files_per_commit: 16
   max_diff_chars: 1200
   max_total_diff_chars: 20000

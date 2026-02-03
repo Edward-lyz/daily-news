@@ -311,6 +311,7 @@ def build_prompt(
             "Write the report in Chinese.",
             "总结仓库的改动时，需要在你说出的每个总结的点上都附上对应的 github 的 PR 链接，方便跳转。没有 PR 链接就给出 commit 名称。",
             "总结不能过于潦草，需要严谨地指出，哪里组件/模块改动了什么具体细节，最好有简短的代码片段。",
+            "开头必须是：今日的 AI Infra 的新闻如下。"
         ],
     }
     return json.dumps(payload, ensure_ascii=True)
@@ -467,6 +468,7 @@ def build_readme(date_str: str, report: str, archive_dates: List[str]) -> str:
     lines.append("")
     lines.append("## 往期回顾")
     filtered_dates = [d for d in archive_dates if d != date_str]
+    filtered_dates = filtered_dates[:7]
     if filtered_dates:
         for report_date in filtered_dates:
             lines.append(f"- [{report_date}](reports/{report_date}.md)")
