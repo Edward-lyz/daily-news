@@ -7,64 +7,534 @@
 ---
 
 ## 最新解读 (2026-02-02)
-## 摘要
+今日的 AI Infra 的新闻如下。
 
-本周 AI 基础设施领域重点关注大模型推理优化、多模态模型服务、神经形态计算以及高效训练方法。vLLM-Omni 推出了全解耦的多模态模型服务系统，FlashInfer 添加了对 Mamba 模型的支持，NVIDIA Cutlass 修复了 Blackwell 架构下的 GEMM 问题。同时，多个研究团队提出了创新的推理优化方法和高效训练框架。
+## 摘要
+本期更新聚焦于 **高性能算子同步与优化**：DeepGEMM 在 SM100 上通过 `tcgen05_after_thread_sync` 提升 MQA 同步安全；Cutlass 修复了 SM100 block‑scale GEMM 的累加器重叠问题，并在 Python 示例中加入 `ceil_div` 计算；FlashInfer 大幅扩展了新硬件支持，新增 SM90/SM103 的 FP8/FP4 GEMM、MTP 多 token 预测以及 CI Docker 镜像同步；Flash‑Attention 修正了 `compute_block_sparsity` 参数传递，提升 mask 计算的可靠性；sglang 引入 Mooncake NVLink 跨节点 KV 传输、动态 chunk 预热以及多项文档/测试改进；vLLM 继续清理旧特性、完善 MoE 与 LoRA 的兼容性，并在多 GPU、CPU、XPU 环境下提升编译与调度效率。整体来看，算子层面的同步、跨架构兼容以及 CI 稳定性是本轮提交的核心驱动。
 
 ## 具体内容分析
+### deepseek-ai/DeepGEMM
+**提交**  
+- **commit** `477618c` – [Fix a sync issue in SM100 MQA logits (#285)](https://github.com/deepseek-ai/DeepGEMM/pull/285) – https://github.com/deepseek-ai/DeepGEMM/commit/477618cd51baffca09c4b0b87e97c03  
+  - **模块/文件** `deep_gemm/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh`  
+    - 新增 `tcgen05_after_thread_sync();` 在 UMMA 同步点后，确保线程间同步安全。  
+  - **模块/文件** `deep_gemm/include/deep_gemm/impls/sm100_fp8_paged_mqa_logits.cuh`  
+    - 在查询阶段切换时加入 `full_q_barriers[q_stage_idx]->wait(q_phase);`，并在 UMMA 等待前同样插入 `tcgen05_after_thread_sync();`，提升分页 MQA 的同步可靠性。  
 
-### 重要论文
+**Issues**  
+- 本次提交未关联任何 Issue。
+### deepseek-ai/FlashMLA
+昨日无更新。
+### NVIDIA/cutlass
+- **提交**  
+  - **SHA**: `1cfbb53`  
+  - **标题**: `[CuTeDSL] Fix: SM100 block‑scale gemm overlapping accumulator (#2995)`  
+  - **作者**: Hua Huang  
+  - **日期**: 2026‑02‑03  
+  - **PR 链接**: https://github.com/NVIDIA/cutlass/pull/2995  
+  - **提交链接**: https://github.com/NVIDIA/cutlass/commit/1cfbb53a23cf009973a6a6ea9e8275c8a691d411  
+  - **涉及文件**:  
+    - `examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py`  
+      ```python
+      def ceil_div(a, b):
+          return (a + b - 1) // b
+      ...
+      self.threads_per_warp = 32
+      self.threads_per_cta = self.threads_per_warp * len(
+          (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id)
+      )
+      self.epilog_sync_barrier = pipeline.NamedBarrier(
+          barrier_id=1,
+          num_threads=self.threads_per_warp * len(self.epilog_warp_id),
+      )
+      ```  
+    - `examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent_prefetch.py`（同上，新增 `ceil_div` 与 `threads_per_warp` 计算）  
 
-1. **ReasonCACHE: Teaching LLMs To Reason Without Weight Updates**  
-   提出使用 Prefix Tuning 让 LLM 无需权重更新即可学习推理能力，通过将演示蒸馏为固定的键值缓存，在保持推理效率的同时提升了复杂推理任务的性能。
+- **Issue**  
+  - **标题**: *[QST] what is `examples/python/CuTeDSL/advanced_compiler_control` for?*  
+  - **链接**: https://github.com/NVIDIA/cutlass/issues/2994  
+  - **作者**: thakkarV  
+  - **创建时间**: 2026‑02‑02 23:26 UTC  
+  - **简要描述**: 该目录仅包含一个二进制文件，未在 README 中提及，提问其示例用途。
+### flashinfer-ai/flashinfer
+**提交概览（按时间倒序）**
 
-2. **vLLM-Omni: Fully Disaggregated Serving for Any-to-Any Multimodal Models**  
-   针对任何到任何多模态模型推出全解耦服务系统，通过阶段抽象和图执行优化，将任务完成时间减少高达 91.4%。
+- **2d7a987** – 为 `moeAlltoAllKernels.cu` 添加 SM90 条件编译，使用 `asm volatile("fence.release.sys;")` 在 SM90 及以上平台，否则回退到 `__threadfence_system()`。  
+  PR 链接: <https://github.com/flashinfer-ai/flashinfer/pull/2439>
 
-3. **Energy-Efficient Neuromorphic Computing for Edge AI: A Framework with Adaptive Spiking Neural Networks**  
-   提出 NeuEdge 框架，结合自适应 SNN 模型和硬件感知优化，在边缘设备上实现 91-96% 的准确率和 847 GOp/s/W 的能效。
+- **b7404d0** – 引入 **MTP（Multi‑Token Prediction）** 支持的 Mamba 选择性状态更新，实现 `selective_state_update` 的多 token 版本并新增大量 CUDA 实现文件（`common.cuh`, `kernel_selective_state_update_mtp.cuh`, `kernel_selective_state_update_stp.cuh` 等），以及对应的 Python 测试套件。  
+  PR 链接: <https://github.com/flashinfer-ai/flashinfer/pull/2444>
 
-4. **Backpropagation as Physical Relaxation: Exact Gradients in Finite Time**  
-   证明反向传播是物理动力系统在有限时间内的精确松弛，为模拟和神经形态 substrate 中的梯度计算提供了理论基础。
+- **273c09c** – 更新 CI Docker 镜像标签至 `20260203-9b5901e`，保持构建环境同步。  
+  PR 链接: <https://github.com/flashinfer-ai/flashinfer/pull/2475>
 
-### 关键代码库更新
+- **95d8511** – 在 `bench_topk.py` 中加入 `sgl_kernel.fast_topk_v2` 基准，提升 Top‑K 性能评测的覆盖度。  
+  PR 链接: <https://github.com/flashinfer-ai/flashinfer/pull/2461>
 
-#### [vllm-project/vllm](https://github.com/vllm-project/vllm)
-- **新增 Step-3.5-Flash 模型支持** ([PR #33523](https://github.com/vllm-project/vllm/pull/33523))
-- **修复推理内容重命名导致的回归** ([Issue #33616](https://github.com/vllm-project/vllm/issues/33616))
-- **优化 DeepSeekR1 在 Blackwell 上的吞吐量** ([Issue #33583](https://github.com/vllm-project/vllm/issues/33583))
-- **添加 DeepSeek-OCR-2 支持** ([PR #33165](https://github.com/vllm-project/vllm/pull/33165))
+- **9b5901e** – Dockerfile 系列（cu126~cu130）新增 `LD_LIBRARY_PATH` 环境变量，确保在容器内正确检测到 cuBLAS。  
+  PR 链接: <https://github.com/flashinfer-ai/flashinfer/pull/2468>
 
-#### [flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer)
-- **添加 Mamba 模型支持** ([PR #2444](https://github.com/flashinfer-ai/flashinfer/pull/2444))
-- **新增 SM103 特定调度器** ([PR #2303](https://github.com/flashinfer-ai/flashinfer/pull/2303))
-- **修复 FP8 MoE 路由 logits 类型问题** ([Issue #2469](https://github.com/flashinfer-ai/flashinfer/issues/2469))
-- **添加 SM90 fence PTX 保护** ([PR #2439](https://github.com/flashinfer-ai/flashinfer/pull/2439))
+- **c7761ad** – 为 SM103 架构添加专属的 NVFP4 CUTLASS 调度器，新增 `fp4_gemm_cutlass_sm103.cu` 与对应的模板头文件，实现更高效的 FP4 GEMM。  
+  PR 链接: <https://github.com/flashinfer-ai/flashinfer/pull/2303>
 
-#### [sgl-project/sglang](https://github.com/sgl-project/sglang)
-- **支持 Mooncake 节点内 NVLink KV 传输** ([PR #17866](https://github.com/sgl-project/sglang/pull/17866))
-- **添加 Step-3.5-Flash 模型支持** ([PR #18084](https://github.com/sgl-project/sglang/pull/18084))
-- **修复 HiCache DeepSeek v32 CPU 卸载** ([PR #17415](https://github.com/sgl-project/sglang/pull/17415))
-- **优化基数缓存驱逐性能** ([PR #14339](https://github.com/sgl-project/sglang/pull/14339))
+- **3fa8905** – 修复 `fused_moe` 模块的 stub 生成目录错误，确保 JIT 编译路径正确。  
+  PR 链接: <https://github.com/flashinfer-ai/flashinfer/pull/2445>
 
-#### [NVIDIA/cutlass](https://github.com/NVIDIA/cutlass)
-- **修复 SM100 block-scale GEMM 重叠累加器问题** ([PR #2995](https://github.com/NVIDIA/cutlass/pull/2995))
-- **添加 Blackwell 架构支持** ([Issue #2994](https://github.com/NVIDIA/cutlass/issues/2994))
+- **806339f** – `set_log_level` 现在真正修改全局 logger 等级，开启 DEBUG 日志输出。  
+  PR 链接: <https://github.com/flashinfer-ai/flashinfer/pull/2449>
 
-### 值得关注的问题
+- **9329fb4** – 修正 `_cudnn_gemm_fp4_requirement` 参数类型错误，提升 FP4 GEMM 的兼容性。  
+  PR 链接: <https://github.com/flashinfer-ai/flashinfer/pull/2450>
 
-1. **vLLM 依赖兼容性问题** ([Issue #33599](https://github.com/vllm-project/vllm/issues/33599))  
-   vLLM 严格的依赖约束与下游生态系统（如 Ray）存在兼容性冲突，需要改进依赖管理策略。
+---
 
-2. **Flash Attention Blackwell 架构支持** ([Issue #2220](https://github.com/Dao-AILab/flash-attention/issues/2220))  
-   用户在 NVIDIA AGX Thor（Blackwell 架构）上运行时遇到 `cudaErrorNoKernelImageForDevice` 错误。
+**关键模块/文件变动（摘录）**
 
-3. **SGLang KV 缓存卸载问题** ([Issue #18135](https://github.com/sgl-project/sglang/issues/18135))  
-   GLM 4.6 FP8 模型在使用 Flash Infer 后端时出现 KV 缓存卸载问题。
+- `csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.cu`  
+  ```cpp
+  #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("fence.release.sys;");
+  #else
+    __threadfence_system();
+  #endif
+  ```
 
-4. **推理内容字段命名回归** ([Issue #33616](https://github.com/vllm-project/vllm/issues/33616))  
-   `reasoning_content` 到 `reasoning` 的重命名导致依赖 `reasoning_content` 的聊天模板出现兼容性问题。
+- `include/flashinfer/mamba/common.cuh`（新增）  
+  包含通用向量加载、warp 工具函数等，为后续 MTP/STP 核心实现提供基础设施。
+
+- `include/flashinfer/mamba/kernel_selective_state_update_mtp.cuh`（新增）  
+  实现 `selective_state_update_kernel_simple_mtp`，使用共享存储结构 `SharedStorageSimple`，支持 `TOKENS_MTP`、`DIM`、`DSTATE` 多维度模板实例化。
+
+- `include/flashinfer/mamba/kernel_selective_state_update_stp.cuh`（新增）  
+  单 token 版的选择性状态更新实现，加入冲突规避的共享内存列索引计算。
+
+- `include/flashinfer/gemm/fp4_gemm_template_sm103.h` 与 `fp4_gemm_cutlass_sm103.cu`（新增）  
+  为 SM103 GPU 添加 FP4 GEMM 调度器，使用 CUTLASS 进行高效矩阵乘。
+
+- `docker/Dockerfile.cu126`、`Dockerfile.cu128`、`Dockerfile.cu129`、`Dockerfile.cu130`（修改）  
+  ```dockerfile
+  ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+  ```
+
+- `include/flashinfer/logging.h`（微调）  
+  `set_log_level` 现在调用 `spdlog::set_level(level)`，确保日志级别生效。
+
+---
+
+**Issues 关注（简要说明）**
+
+- **#2469** – `trtllm_fp8_per_tensor_scale_moe` 与 `trtllm_fp8_block_scale_moe` 在非 DeepSeek 场景下不支持 `routing_logits==float32`，导致 vLLM 中 `MiniMaxAI/MiniMax-M2.1` 等模型出现错误。  
+  链接: <https://github.com/flashinfer-ai/flashinfer/issues/2469>
+
+- **#2466** – 需求将 **cuteDSL** 的 FP4 稠密 GEMM 集成进 FlashInfer，以统一 FP4 加速路径。  
+  链接: <https://github.com/flashinfer-ai/flashinfer/issues/2466>
+
+- **#2463** – 询问是否可以强制本地生成 PTX 并在运行时使用 PTX 而非预编译的 SASS，便于调试和自定义编译。  
+  链接: <https://github.com/flashinfer-ai/flashinfer/issues/2463>
+
+---
+
+**整体评估**
+
+本次提交显著扩展了 FlashInfer 的功能边界：  
+1. **Mamba 多 token 预测**（MTP）实现，为大模型推理提供更高吞吐。  
+2. **SM90 与 SM103 专属优化**，提升在最新 NVIDIA GPU（Ada、Hopper）上的性能与兼容性。  
+3. **CI 与 Docker 环境细节**（标签、库路径）得到完善，保证持续集成的可靠性。  
+4. **基准与日志改进**（Top‑K 基准、DEBUG 日志）提升了开发者调试与性能评估的体验。  
+
+这些改动共同推动 FlashInfer 在高性能推理、跨架构适配以及开发者友好性方面迈出重要一步。
+### Dao-AILab/flash-attention
+**提交**  
+- **SHA**: `514e63c`  
+- **链接**: https://github.com/Dao-AILab/flash-attention/commit/514e63cc26e90719f9d3332eef33146d8f69e1d2  
+- **作者**: zhuochen  
+- **日期**: 2026‑02‑02 21:41:42 UTC  
+- **改动概览**:  
+  - **文件**: `tests/cute/benchmark_mask_mod.py`（修改）  
+  - **行数**: +14 / -15 = 29 行改动  
+  - **关键修改**（摘录）:  
+    ```python
+    # 原始调用
+    compute_block_sparsity(...)
+    # 修正后
+    compute_block_sparsity(..., use_mask=True)
+    ```  
+    该提交修正了基准测试中 `compute_block_sparsity` 参数的使用方式，确保在 `benchmark_mask_mod` 中正确传递 mask 参数。
+
+**Issues**  
+1. **标题**: Support for Blackwell Architecture  
+   - **链接**: https://github.com/Dao-AILab/flash-attention/issues/2220  
+   - **作者**: jiminbae  
+   - **创建时间**: 2026‑02‑02 07:56:07 UTC  
+   - **摘要**: 在 NVIDIA AGX Thor（Blackwell 架构）上运行 Isaac‑GR00T 推理时出现 `RuntimeError: cudaErrorNoKernelImageForDevice`，怀疑是 Flash‑Attention 尚未支持 Blackwell。  
+
+2. **标题**: import error with release whl file  
+   - **链接**: https://github.com/Dao-AILab/flash-attention/issues/2219  
+   - **作者**: zshnb  
+   - **创建时间**: 2026‑02‑02 06:46:00 UTC  
+   - **摘要**: 使用 CentOS、CUDA 12.8、Python 3.13、torch 2.8.0，安装官方 wheel `flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp313-cp313-linux_x86_64.whl` 后，导入时报错缺少符号 `_ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_ib`。  
+
+> 注：两个 Issue 的正文均未完整展示，若需进一步细节，请访问对应链接。
+### sgl-project/sglang
+- **a45647b** – *[PD] feat: support mooncake intra-node nvlink kv transfer*  
+  **作者**：Lewis **时间**：2026‑02‑03 09:47:52 UTC **链接**：<https://github.com/sgl-project/sglang/commit/a45647bce16ddf159713a65c3b281c7e66700bcc>  
+  **改动文件**：  
+  - `python/sglang/srt/disaggregation/mooncake/utils.py`（+3 ‑1）  
+  - `python/sglang/srt/disaggregation/utils.py`（+3 ‑0）  
+  简要：在 Mooncake 组件中加入 NVLink 跨节点 KV 传输支持，提升 intra‑node 通信效率。
+
+- **cc69ac9** – *Warmup before profiling prefill latency for dynamic chunk sizing*  
+  **作者**：Xiaowei Wang **时间**：2026‑02‑03 09:45:23 UTC **链接**：<https://github.com/sgl-project/sglang/commit/cc69ac9e7a7d94fac0b94b8d4d19bf62af69df15>  
+  **改动文件**：  
+  - `python/sglang/srt/managers/scheduler_pp_mixin.py`（+3 ‑2）  
+  简要：在预填充阶段加入 warm‑up 步骤，以便更精准地测量动态 chunk 大小的延迟。
+
+- **8e933e1** – *AMD PD/D PR ci*  
+  **作者**：Zhaoyi Li **时间**：2026‑02‑03 07:29:14 UTC **链接**：<https://github.com/sgl-project/sglang/commit/8e933e1914b6b335e58bb1442b3931e2303192bb>  
+  **改动文件**：  
+  - `.github/workflows/pr-test-amd.yml`（+113 ‑0）  
+  - `scripts/ci/amd/amd_ci_start_container_disagg.sh`（+244 ‑0）  
+  - `test/registered/amd/disaggregation/test_disaggregation_basic.py`（+422 ‑0）  
+  - `test/registered/amd/disaggregation/test_disaggregation_pp.py`（+291 ‑0）  
+  - `test/run_suite.py`（+1 ‑0）  
+  简要：为 AMD 平台新增 CI 工作流及基础/并行分布式测试脚本。
+
+- **25508d1** – *[Docker] Remove hardcoded `America/Los_Angeles` timezone, default to UTC*  
+  **作者**：Mohammad Miadh Angkad **时间**：2026‑02‑03 07:22:15 UTC **链接**：<https://github.com/sgl-project/sglang/commit/25508d11c03cb1344a1cffc8e4e9e517181388f0>  
+  **改动文件**：  
+  - `docker/Dockerfile`（+1 ‑5）  
+  - `docker/gateway.Dockerfile`（+1 ‑3）  
+  简要：Docker 镜像默认时区改为 UTC，去除对美西时区的硬编码。
+
+- **6f6b9c6** – *[Perf] Use safetensors `load_file` in multithread loader*  
+  **作者**：Mohammad Miadh Angkad **时间**：2026‑02‑03 07:21:13 UTC **链接**：<https://github.com/sgl-project/sglang/commit/6f6b9c6e42a927f087276536f225147eb8507714>  
+  **改动文件**：  
+  - `python/sglang/srt/model_loader/weight_utils.py`（+2 ‑6）  
+  简要：在多线程权重加载器中改用 safetensors 的 `load_file`，提升加载性能。
+
+- **7a9d9c7** – *[HiCache] fix: apply extra_backend_tag in Mooncake batch_exists*  
+  **作者**：fatSheep **时间**：2026‑02‑03 06:54:56 UTC **链接**：<https://github.com/sgl-project/sglang/commit/7a9d9c79d15dfa7c2c1ff9685ea7fba3d5c599ad>  
+  **改动文件**：  
+  - `python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py`（+5 ‑0）  
+  简要：在 Mooncake 批次检查中正确使用 `extra_backend_tag`，修复缓存一致性问题。
+
+- **74f716d** – *Gigachat 3 tool parser and tests*  
+  **作者**：Viacheslav **时间**：2026‑02‑03 06:28:34 UTC **链接**：<https://github.com/sgl-project/sglang/commit/74f716dbd711bef3bd7bc9d6eab7ebc675e47e65>  
+  **改动文件**：  
+  - `docs/advanced_features/server_arguments.md`（+1 ‑1）  
+  - `python/sglang/srt/function_call/function_call_parser.py`（+2 ‑0）  
+  - `python/sglang/srt/function_call/gigachat3_detector.py`（+209 ‑0）  
+  - `test/registered/function_call/test_function_call_parser.py`（+506 ‑0）  
+  简要：新增对 Gigachat‑3 工具调用的检测与解析，并补充对应单元测试。
+
+- **4181290** – *[NVIDIA] Add --top-k argument to run_eval.py*  
+  **作者**：Kaixi Hou **时间**：2026‑02‑03 06:17:53 UTC **链接**：<https://github.com/sgl-project/sglang/commit/4181290efd668082109055c53261a5c956817caa>  
+  **改动文件**：  
+  - `python/sglang/test/run_eval.py`（+10 ‑1）  
+  简要：在评估脚本中加入 `--top-k` 参数，支持 Top‑K 采样评估。
+
+- **fe57a88** – *[TestFix] use unit tests for LoRA overlap loading tests*  
+  **作者**：Glen Liu **时间**：2026‑02‑03 06:06:50 UTC **链接**：<https://github.com/sgl-project/sglang/commit/fe57a887b110a52670fcaa5c616cd0a8dce12615>  
+  **改动文件**：  
+  - `test/registered/lora/test_lora_overlap_loading.py`（+127 ‑9）  
+  简要：将 LoRA 重叠加载的验证改为单元测试形式，提高 CI 稳定性。
+
+- **f032c4f** – *Support Markdown/Notebook‑Friendly Documentation Export for Downstream Integration*  
+  **作者**：Kun Lin **时间**：2026‑02‑03 05:43:20 UTC **链接**：<https://github.com/sgl-project/sglang/commit/f032c4f3d66605edd3177ac7d242c3d9704888bf>  
+  **改动文件**：  
+  - `.github/workflows/release-docs.yml`（+1 ‑0）  
+  - `docs/Makefile`（+20 ‑0）  
+  - `docs/README.md`（+68 ‑1）  
+  简要：改进文档生成流程，支持 Markdown 与 Notebook 输出，便于下游集成。
+
+- **78bf13d** – *MoE Refactor: Refactor `modelopt_quant.py` → `flashinfer_trllm.py`*  
+  **作者**：b8zhong **时间**：2026‑02‑03 04:45:14 UTC **链接**：<https://github.com/sgl-project/sglang/commit/78bf13db4447b98eb9d8169c400448d1dcad12a3>  
+  **改动文件**：  
+  - `python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py`（+277 ‑15）  
+  - `python/sglang/srt/layers/quantization/fp8.py`（+1 ‑0）  
+  - `python/sglang/srt/layers/quantization/modelopt_quant.py`（+64 ‑176）  
+  简要：将 MoE 量化实现迁移至 FlashInfer‑TRT‑LLM，精简旧代码并提升兼容性。
+
+- **eedd472** – *[Diffusion] fix serving image_edit get input image bug*  
+  **作者**：Xiaoyu Zhang **时间**：2026‑02‑03 04:17:16 UTC **链接**：<https://github.com/sgl-project/sglang/commit/eedd472025c4f3d0247c5ef4f05dce54663a09c9>  
+  **改动文件**：  
+  - `python/sglang/multimodal_gen/runtime/pipelines/diffusers_pipeline.py`（+3 ‑0）  
+  简要：修复 `image_edit` 流程中获取输入图像的错误。
+
+- **e484c90** – *Add triton_fused_moe config for GLM-4.7-FP8 tp8 H20 H20-3e*  
+  **作者**：Hank Han **时间**：2026‑02‑03 04:08:23 UTC **链接**：<https://github.com/sgl-project/sglang/commit/e484c90cc7aa3340b073be1d09e0731fb414c9ca>  
+  **改动文件**：  
+  - `python/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_5_1/E=161,N=192,device_name=NVIDIA_H20,dtype=fp8_w8a8,per_channel_quant=True.json`（+146）  
+  - `python/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_5_1/E=161,N=192,device_name=NVIDIA_H20-3e,dtype=fp8_w8a8,per_channel_quant=True.json`（+146）  
+  简要：为 GLM‑4.7‑FP8（tp8）在 H20 系列 GPU 上添加 Triton fused MoE 配置。
+
+- **9b1619c** – *[Move sgl‑kernel Kernel to JIT] Add JIT concat MLA kernels*  
+  **作者**：Linyu Wu **时间**：2026‑02‑03 02:49:17 UTC **链接**：<https://github.com/sgl-project/sglang/commit/9b1619c148a0a800e9ddb3d2e42ff32ee2dd2679>  
+  **改动文件**：  
+  - `python/sglang/jit_kernel/benchmark/bench_concat_mla.py`（+163）  
+  - `python/sglang/jit_kernel/concat_mla.py`（+65）  
+  - `python/sglang/jit_kernel/csrc/elementwise/concat_mla.cuh`（+325）  
+  - `python/sglang/jit_kernel/tests/test_concat_mla.py`（+169）  
+  简要：新增 JIT 编译的 concat‑MLA 核心，实现更灵活的多头注意力拼接。
+
+- **62004fd** – *[diffusion] UX: improve logging*  
+  **作者**：Mick **时间**：2026‑02‑03 02:35:05 UTC **链接**：<https://github.com/sgl-project/sglang/commit/62004fd2beb77daa10502e292e66a0d2f5662e3e>  
+  **改动文件**：  
+  - `python/sglang/multimodal_gen/runtime/managers/gpu_worker.py`（+1）  
+  - `python/sglang/multimodal_gen/runtime/pipelines/diffusers_pipeline.py`（+3 ‑3）  
+  - `python/sglang/multimodal_gen/runtime/pipelines_core/composed_pipeline_base.py`（‑2）  
+  - `python/sglang/multimodal_gen/runtime/pipelines_core/stages/latent_preparation.py`（+2 ‑8）  
+  - `python/sglang/multimodal_gen/runtime/utils/logging_utils.py`（+13 ‑27）  
+  简要：统一并精简 Diffusion 相关日志输出，提升可观测性。
+
+- **1805943** – *[HiCache]: Support DeepSeek v32 cpu offloading*  
+  **作者**：zhangheng **时间**：2026‑02‑03 02:07:37 UTC **链接**：<https://github.com/sgl-project/sglang/commit/180594358b990b2a5ce8140fb64aae90d73910fd>  
+  **改动文件**：  
+  - `python/sglang/srt/mem_cache/hiradix_cache.py`（+15 ‑1）  
+  - `python/sglang/srt/mem_cache/memory_pool_host.py`（+189 ‑31）  
+  - `test/registered/hicache/test_nsa_pool_host_unit.py`（+130）  
+  简要：为 DeepSeek‑v32 引入 CPU 端的 HiCache offloading 支持，并补充单元测试。
+
+- **a1bbc89** – *[Diffsuion & JIT_kernel] QKNorm cross heads kernel*  
+  **作者**：Xiaoyu Zhang **时间**：2026‑02‑03 02:03:17 UTC **链接**：<https://github.com/sgl-project/sglang/commit/a1bbc892af27867901f91e9a1c485824ff9337a6>  
+  **改动文件**：  
+  - `python/sglang/jit_kernel/benchmark/bench_qknorm_across_heads.py`（+121）  
+  - `python/sglang/jit_kernel/csrc/elementwise/qknorm_across_heads.cuh`（+232）  
+  - `python/sglang/jit_kernel/norm.py`（+34）  
+  - `python/sglang/jit_kernel/tests/test_qknorm_across_heads.py`（+75）  
+  简要：实现跨头 QK 归一化的 JIT kernel，提升多头注意力的数值稳定性。
+
+- **fd983b0** – *[Performance] Optimize radix cache eviction performance*  
+  **作者**：EkiRui **时间**：2026‑02‑03 01:44:20 UTC **链接**：<https://github.com/sgl-project/sglang/commit/fd983b09b68c076d448a55266a29ffdfdff2d06e>  
+  **改动文件**：  
+  - `python/sglang/srt/mem_cache/hiradix_cache.py`（+77 ‑27）  
+  - `python/sglang/srt/mem_cache/mamba_radix_cache.py`（‑13）  
+  - `python/sglang/srt/mem_cache/radix_cache.py`（+26 ‑15）  
+  - `python/sglang/srt/mem_cache/swa_radix_cache.py`（‑13）  
+  简要：对 Radix 缓存驱逐逻辑进行优化，显著降低缓存淘汰时的开销。
+
+- **c8da307** – *feature: adding gpt‑oss 120b nightly test*  
+  **作者**：Douglas Yang **时间**：2026‑02‑03 01:11:28 UTC **链接**：<https://github.com/sgl-project/sglang/commit/c8da307d7e6353fdcfdf6ca1ecb1cec854411230>  
+  **改动文件**：  
+  - `.github/workflows/nightly-test-nvidia.yml`（±4）  
+  - `test/registered/8-gpu-models/test_gpt_oss_120b.py`（+84）  
+  简要：在 nightly CI 中加入对 GPT‑OSS 120B 模型的 8‑GPU 测试。
+
+- **28e2340** – *Fix HF hub race condition in CI by coordinating model downloads across TP ranks*  
+  **作者**：Alison Shao **时间**：2026‑02‑02 22:57:45 UTC **链接**：<https://github.com/sgl-project/sglang/commit/28e23407259d665ef92ec0a19b7fe4e5c60234ff>  
+  **改动文件**：  
+  - `.github/workflows/pr-test.yml`（±21）  
+  - `python/sglang/srt/model_loader/ci_weight_validation.py`（+113 ‑31）  
+  简要：在 CI 中同步多卡模型权重下载
+### vllm-project/vllm
+**提交**  
+
+- **e346e2d** – [Bugfix] Disable RoutingMethodType.[Renormalize,RenormalizeNaive] TRTLLM per‑tensor FP8 MoE  
+  - 变更文件：`vllm/model_executor/layers/fused_moe/flashinfer_trtllm_moe.py`（+4 –2）  
+
+- **83449a5** – [Refactor] Clean up pooling serial utils  
+  - 关键文件：`vllm/entrypoints/pooling/utils.py`（新增 124 行）  
+  - 其他涉及：`examples/pooling/embed/*`、`tests/entrypoints/pooling/*`、`vllm/utils/serial_utils.py`（大幅重构，+41 –157）  
+
+- **dad2d6a** – [Bugfix][Model] Fix DeepSeek‑OCR‑2 chat template to include BOS token  
+  - 关键文件：`vllm/transformers_utils/configs/deepseek_vl2.py`（+5 –4）  
+
+- **32e84fa** – [CI/Build] Investigate torchrun distributed tests hanging issue  
+  - 关键文件：`tests/distributed/test_torchrun_example*.py`（各 +3）  
+
+- **fd9c83d** – [torch.compile] Document workaround for `standalone_compile` failure  
+  - 关键文件：`docs/design/debug_vllm_compile.md`（+9）  
+  - 代码更新：`vllm/compilation/compiler_interface.py`（+19）  
+
+- **b95cc50** – [Misc] Remove deprecated `VLLM_ALL2ALL_BACKEND` env var  
+  - 关键文件：`vllm/config/parallel.py`（‑9）、`vllm/envs.py`（‑33）  
+
+- **6139789** – [Minor] Simplify `scheduler.py` logic  
+  - 关键文件：`vllm/v1/core/sched/scheduler.py`（+19 –29）  
+
+- **ef248ff** – [Misc] Remove deprecated profiler env vars  
+  - 关键文件：`vllm/config/profiler.py`（‑81）、`vllm/envs.py`（‑14）  
+
+- **e106044** – [XPU][1/N] Deprecate ipex, switch to `vllm‑xpu‑kernels`  
+  - 大幅改动：`vllm/_ipex_ops.py`（‑360 +73）等 XPU 相关层实现  
+
+- **bf001da** – [Bugfix] Interleaved thinking keeps compatibility with `reasoning_content`  
+  - 关键文件：`vllm/entrypoints/chat_utils.py`（+3）  
+
+- **a0a984a** – [CI/Build] Remove hard‑coded America/Los_Angeles timezone from Dockerfiles  
+  - 关键文件：`docker/Dockerfile*`（共‑12 行）  
+
+- **f1cb9b5** – Fix quantized Falcon‑H1 model loading issues  
+  - 关键文件：`vllm/model_executor/models/falcon_h1.py`（+14 –2）  
+
+- **4c4b6f7** – [Frontend] Add sampling parameters to Responses API  
+  - 关键文件：`vllm/entrypoints/openai/responses/protocol.py`（+28 –1）  
+  - 新增测试：`tests/entrypoints/openai/responses/test_sampling_params.py`（+113）  
+
+- **10546f9** – [Bugfix] Fix mm budget setting for Qwen Omni models  
+  - 关键文件：`vllm/multimodal/budget.py`（+5）  
+
+- **e69c990** – [Feature][CPU Backend] Optimize ARM vectorization backend  
+  - 关键文件：`csrc/cpu/cpu_types_arm.hpp`（+551 –579）等 CPU 相关实现  
+
+- **5eac9a1** – [torch.compile] Skip fast MoE cold‑start opt when speculative decoding is enabled  
+  - 关键文件：`vllm/config/compilation.py`（+18）  
+
+- **1b60b45** – [CI/Build] Add directions for CPU image upload to Docker Hub  
+  - 关键文件：`.buildkite/scripts/annotate-release.sh`（+23）  
+
+- **4b3803d** – [BugFix] `DPMetadata` assert error for dense model fixed  
+  - 关键文件：`vllm/forward_context.py`（+5 –3）  
+
+- **5019c59** – [Voxtral Realtime] Introduce global log‑mel max  
+  - 关键文件：`vllm/model_executor/models/voxtral.py`（+13 –1）  
+
+- **089cd4f** – Fix `cutlass_3x_gemm_fp8_blockwise` on sm103a  
+  - 关键文件：`csrc/cutlass_extensions/common.hpp`（+88 –6）等多处 CUDA kernel 实现  
+
+- **0130223** – Fix memory for online FP8 quantization with streaming weight load  
+  - 关键文件：`vllm/model_executor/layers/quantization/fp8.py`（+119 –4）  
+
+- **5d1aef3** – [UX] Format attention backend log line  
+  - 关键文件：`vllm/platforms/cuda.py`（±2）  
+
+- **ffe1fc7** – Reduce kernel overhead when active LoRAs < max LoRAs (multiple CUDA graphs)  
+  - 关键文件：`vllm/lora/ops/triton_ops/*`、`vllm/v1/cudagraph_dispatcher.py`（共 +389 –66）  
+
+- **8b7346d** – Update `huggingface‑hub` version in test requirements  
+  - 关键文件：`requirements/*`（±2）  
+
+- **6141ebe** – Remove incorrect tokenizer info test  
+  - 关键文件：`tests/entrypoints/openai/test_tokenization.py`（‑20）  
+
+- **199e3cb** – [Model] Use `mm_position` to compute mrope positions for GLM‑4.xV  
+  - 关键文件：`vllm/model_executor/models/glm4*_*.py`（大幅改动，+130 –252）  
+
+- **9f8cb81** – [CI] Add DeepSeek V3.2 nightly eval configs  
+  - 关键文件：`tests/evals/gsm8k/configs/DeepSeek‑V3.2-*.yaml`（+11 ×2）  
+
+- **d7e17aa** – [Refactor] Move profiling methods to MM budget  
+  - 关键文件：`vllm/multimodal/budget.py`（新增 154 行）  
+
+- **528e9b1** – [Feature][Core] Support Fabric detection for MNNVL protocol (GB series)  
+  - 关键文件：`csrc/cumem_allocator.cpp`（+18 –1）  
+
+- **d95b4be** – Move spec‑decode slow test to `test_areas.yaml`  
+  - 关键文件：`.buildkite/test_areas/misc.yaml`（+16 –2）  
+
+- **4061dcf** – [Bugfix] Enable Kimi k25 processor test  
+  - 关键文件：`vllm/model_executor/models/kimi_k25.py`（+27 –5）  
+
+- **0aca8b8** – [MoE] Enable shared/routed overlap for latent MoE (Nemotron‑H)  
+  - 关键文件：`vllm/model_executor/layers/fused_moe/layer.py`（+89 –16）  
+
+- **9eb58f8** – Fix ROCm: remove unconditional `aiter` import  
+  - 关键文件：`vllm/_aiter_ops.py`（+12 –4）  
+
+- **b10d05b** – [Model] Use explicit types in `get_generation_prompt`  
+  - 关键文件：`vllm/entrypoints/openai/translations/speech_to_text.py`（+26 –14）  
+
+- **b398e5c** – Update `get_expert_mapping` to include `self` parameter  
+  - 关键文件：`vllm/model_executor/models/glm4_moe_lite.py`（+1）  
+
+- **78061ef** – Fix accessing `hidden_act` from model config  
+  - 关键文件：`vllm/model_executor/models/nemotron_nas.py`（+6 –1）  
+
+- **528b307** – [CI][Bugfix] Fix flaky KV‑connector consistency test  
+  - 关键文件：`tests/v1/kv_connector/unit/test_multi_connector.py`（+4 –3）  
+
+- **a502831** – [Chore] Remove redundant input parsing methods  
+  - 关键文件：`vllm/entrypoints/openai/*`、`vllm/inputs/data.py`（共‑51 行）  
+
+- **ba871fb** – [Misc] Support arbitrary MM datasets in spec‑decode benchmark  
+  - 关键文件：`vllm/benchmarks/datasets.py`（+102）  
+
+- **ab37478** – [CPU][IBM Z][Dockerfile] Fix IBM Z builds  
+  - 关键文件：`docker/Dockerfile.s390x`（+32 –11）  
+
+- **808dd87** – [Model] Support DeepSeek‑OCR‑2  
+  - 关键文件：`vllm/model_executor/models/deepseek_ocr2.py`（新增 444 行）  
+
+- **beb8899** – Fix Mistral sliding‑window parsing  
+  - 关键文件：`vllm/transformers_utils/configs/mistral.py`（+25 –9）  
+
+- **ce88756** – Update example section paths in docs  
+  - 关键文件：`docs/examples/README.md`（±6）  
+
+- **a3154a6** – Add missing model entries in `supported_models.md`  
+  - 关键文件：`docs/models/supported_models.md`（+13 –7）  
+
+- **7c03643** – [Bugfix] GLM‑4 tool parser: incremental string streaming  
+  - 关键文件：`vllm/tool_parsers/glm4_moe_tool_parser.py`（+389 –96）  
+
+- **318b120** – [Nightly CI] Remove CT Model from test list  
+  - 关键文件：`tests/weight_loading/models.txt`（‑1）  
+
+- **c3b40dc** – [Models] Step‑3.5‑Flash support (large addition)  
+  - 关键文件：`vllm/model_executor/models/step3p5*.py`（新增 1 094 行）  
+
+- **a01ef3f** – Fix prefix cache hit‑rate == 0 bug for GPT‑OSS style models  
+  - 关键文件：`vllm/v1/core/kv_cache_coordinator.py`（+23 –7）  
+
+- **7320ca3** – Add unpermute‑aware fused MoE LoRA path  
+  - 关键文件：`vllm/lora/ops/triton_ops/fused_moe_lora_op.py`（+201 –70）  
+
+- **cf0a99f** – [ModelRunner V2] Support spec‑decode with structured outputs  
+  - 关键文件：`vllm/v1/worker/gpu/spec_decode/utils.py`（新增 45 行）  
+
+---
+
+**Issues**  
+
+- **[#33616](https://github.com/vllm-project/vllm/issues/33616)** – *Bug*: `reasoning_content` → `reasoning` 重命名导致聊天模板回归。  
+  - 作者：koush，报告时间：2026‑02‑02 23:38:38。  
+
+- **[#33603](https://github.com/vllm-project/vllm/issues/33603)** – *CI/Build*: 自 2026‑01‑28 起失去对 PyTorch nightly 的信号。  
+  - 作者：atalman，报告时间：2026‑02‑02 21:48:21，已有 1 条评论。  
+
+- **[#33601](https://github.com/vllm-project/vllm/issues/33601)** – *Bug*: 使用 Ray 在单实例上启动 vLLM 副本失败。  
+  - 作者：jiangwu300，报告时间：2026‑02‑02 21:47:03，已截断。  
+
+- **[#33599](https://github.com/vllm-project/vllm/issues/33599)** – *RFC*: 改进 vLLM 依赖兼容性，解决与 Ray 等下游生态冲突。  
+  - 作者：jeffreywang‑anyscale，报告时间：2026‑02‑02 21:31:04，已有 2 条评论。  
+
+- **[#33598](https://github.com/vllm-project/vllm/issues/33598)** – *CI Failure*: Qwen3‑30B‑A3B‑FP8‑block 精度测试在 H100 上报错。  
+  - 作者：AndreasKaratzas，报告时间：2026‑02‑02 21:30:00，已提供错误日志。  
+
+- **[#33596](https://github.com/vllm-project/vllm/issues/33596)** – *CI Failure*: Multi‑Modal Accuracy Eval（小模型）测试失败。  
+  - 作者：AndreasKaratzas，报告时间：2026‑02‑02 21:27:27。
+### NVIDIA/cutile-python
+提交: **7bad878** – Add custom mask to gather/scatter  
+链接: https://github.com/NVIDIA/cutile-python/commit/7bad87895b5b9501df3a7f760e23655aea477e04  
+
+### 文件变更
+| 文件 | 状态 | 行数变化 |
+|------|------|----------|
+| `changelog.d/gather-scatter-mask.md` | 新增 | +4 |
+| `src/cuda/tile/_ir/ops.py` | 修改 | +61 – 12 |
+| `src/cuda/tile/_stub.py` | 修改 | +25 – 6 |
+| `test/test_gather_scatter.py` | 修改 | +195 |
+
+#### 关键代码片段（`src/cuda/tile/_ir/ops.py`）
+```python
+def gather(..., mask=None):
+    if mask is not None:
+        # apply custom mask
+        ...
+    # 原有 gather 实现
+```
+*`_stub.py`* 同步加入 `mask` 参数的函数签名。  
+*`test_gather_scatter.py`* 新增针对 mask 功能的单元测试，覆盖正向与逆向路径。
+
+### 统计信息
+- **新增行**: 285  
+- **删除行**: 18  
+- **总改动**: 303 行  
+
+> 由于 `patch_truncated` 为 true，完整 diff 未展示，详细实现请查看上述 commit 链接。
+
+### Issues
+暂无关联 Issue。
 
 ## 总结
-
-AI 基础设施本周在多模态服务、边缘计算和高效训练方面取得重要进展。vLLM-Omni 的全解耦架构为复杂多模态模型提供了高效服务方案，FlashInfer 对 Mamba 和 SM103 的扩展提升了特定场景的性能，而 NeuEdge 则为边缘 AI 计算提供了新的思路。同时，依赖兼容性和架构支持等挑战仍需社区共同解决。
+⚡️ **关注点**：1️⃣ 新增的 SM90/SM103 优化可能需要在部署脚本中显式指定对应的 CUDA 版本；2️⃣ sglang 的 NVLink KV 传输对网络拓扑有依赖，建议在多节点实验前验证链路带宽；3️⃣ vLLM 的 LoRA 多图优化在高并发场景下仍需监控显存碎片。后续可关注这些改动在实际推理基准中的性能回报，并在 CI 中加入对应硬件的回归测试。
