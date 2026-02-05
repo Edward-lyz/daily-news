@@ -2,8 +2,8 @@ name: daily-ai-infra-report
 
 on:
   schedule:
-    # 01:13 UTC == 09:13 Beijing
-    - cron: "13 1 * * *"
+    # 49:23 UTC == 07:23 Beijing
+    - cron: "49 23 * * *"
   workflow_dispatch: {}
 
 permissions:
