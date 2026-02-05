@@ -14,8 +14,8 @@
 ## 摘要
 ```json
 {
-  "summary": "NVIDIA CUTLASS发布4.4版本，增强CuTe DSL功能并支持CUDA 13.1与GB300架构。FlashInfer修复了权限错误并添加了新的量化方法支持，同时报告了性能问题。Flash-Attention发布3.0稳定版并简化了Flex Flash文档。SGLang实现了多项性能优化，包括KV偏移计算和线性操作融合。vLLM添加了ColBERT模型支持并改进了聊天完成流式传输性能，同时解决了多个兼容性问题。",
-  "conclusion": "需关注CUTLASS中的Blackwell GEMM性能问题和FP8共享内存打印错误。FlashInfer的mxfp4量化内核性能显著低于nvfp4，且存在NaN值生成问题。vLLM的Docker镜像兼容性问题、DeepSeek V3.2基准测试失败以及FA3优化回退可能影响生产环境稳定性。各项目对新型硬件架构的支持仍在发展中，建议在生产环境全面采用前进行充分测试。"
+  "summary": "NVIDIA/cutlass 发布 v4.4 更新，优化 Blackwell GEMM 示例但存在 cuTensorMapEncodeTiled 性能开销问题；flashinfer-ai/flashinfer 新增 FP8 MoE 支持并修复 CI 权限错误；Dao-AILab/flash-attention 标记 Flash Attention 3 为稳定版，修复共享内存竞争条件；sgl-project/sglang 引入 Layerwise Offload for MoVA 和 InternS1-Pro 模型支持，优化线性层融合；vLLM 并行化 CPU CI 测试，集成 ColBERT 模型但报告 FA4 SM90 Decode 性能下降 20%。",
+  "conclusion": "风险点：Cutlass 存在 segmentation fault 和 import error（#3001/#3002），可能影响稳定性；vLLM 报告 Docker 兼容性问题（#33833）和 DeepSeek benchmark 失败（#33831）；SGLang 需更新 speculative decoding 文档（#18268）并解决 FA4 性能瓶颈。"
 }
 ```
 
@@ -25,246 +25,181 @@
 ### deepseek-ai/FlashMLA
 昨日无更新。
 ### NVIDIA/cutlass
-# NVIDIA CUTLASS 更新与问题 (2026-02-04)
-
-## 提交更新
-
-### 版本 4.4 发布更新 (#2999)
-- **提交**: [6b3e607](https://github.com/NVIDIA/cutlass/commit/6b3e607b852f1543dc21323155a2ad71473c8642)
-- **作者**: Junkai-Wu
-
-### CuTe DSL 新功能
-- 支持 CUDA toolkit 13.1
-  - 设置命令: `cutlass/python/CuTeDSL/setup.sh --cu13`
-  - 参考文档: [Python DSL 快速开始指南](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/quick_start.html)
-- 支持 GB300 架构与 CTK 13.1
-  - 示例内核: [SM103 batched 3xFP4 blockscaled GEMM kernel](https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL/blackwell/sm103_dense_blockscaled_gemm_persistent.py)
-- 新增 cute.experimental 高级组合层
-  - 无片段编程模型: copy/dot API 直接接受 memrefs
-  - 自动 TMA 描述符生成和更新插入
-  - SIMT 复制的自动向量和谓词
-  - 新管道抽象与便捷包装器
-  - 新分区操作简化分区逻辑
-  - 设备端 TMA 描述符分配、初始化和管理
-- 提前编译 (AoT) 现已可用
-
-### 新增示例文件
-- `examples/python/CuTeDSL/blackwell/sm103_dense_blockscaled_gemm_persistent.py` (2977 行)
-- `examples/python/CuTeDSL/experimental/ampere/memcpy_simt_universal_copy.py` (155 行)
-- `examples/python/CuTeDSL/experimental/blackwell/dense_block_scaled_gemm.py` (1027 行)
-- `examples/python/CuTeDSL/experimental/blackwell/dense_gemm.py` (1410 行)
-- `examples/python/CuTeDSL/experimental/blackwell/dense_gemm_2sm.py` (522 行)
-- `examples/python/CuTeDSL/experimental/blackwell/dense_gemm_cute_pipeline.py` (1742 行)
-- `examples/python/CuTeDSL/experimental/blackwell/dense_gemm_ptr_array.py` (825 行)
-
-### 内核改进
-- 修复网格依赖问题，在调度器初始化前添加 `cutlass::arch::wait_on_dependent_grids()`
-- 更新多个内核文件以正确处理网格依赖关系
-  - `include/cutlass/gemm/kernel/sm100_gemm_array_tma_warpspecialized.hpp`
-  - `include/cutlass/gemm/kernel/sm100_gemm_array_tma_warpspecialized_input_transform.hpp`
-  - `include/cutlass/gemm/kernel/sm100_gemm_array_tma_warpspecialized_mma_transform.hpp`
-  - `include/cutlass/gemm/kernel/sm90_gemm_array_tma_warpspecialized_cooperative.hpp`
-
-## 问题报告
-
-### 性能开销问题 (#3003)
-- **标题**: Blackwell GEMM 循环中频繁的 cuTensorMapEncodeTiled 和 cudaGetDriverEntryPoint 调用导致的性能开销
-- **作者**: huye566
-- **状态**: 新报告 (0 条评论)
-- **问题描述**: 
-  - 在 Blackwell 架构上使用 CUTLASS 4.x API 进行 GEMM 内核基准测试时，观察到内核启动之间存在显著开销
-  - 分析显示 cuTensorMapEncodeTiled 和 cudaGetDriverEntryPoint 调用频率高
-  - 内核执行时间: 91us，循环1: 625us
-  - 提供了部分 KernelConfigM128 模板代码
-
-### FP8 共享内存打印问题 (#3002)
-- **标题**: 在 fp8 共享内存张量上调用 `cute.print_tensor` 时出现段错误
-- **作者**: 16bit-ykiko
-- **状态**: 已报告 (1 条评论)
-- **问题描述**: 
-  - 在调用 `cute.print_tensor` 处理 swizzled 共享内存张量时出现意外段错误
-  - 提供了部分 HopperFusedMultiHeadAttentionForward 类代码片段
-
-### 导入错误问题 (#3001)
-- **标题**: nvidia-cutlass-dsl v4.4.0.dev1 导入错误
-- **作者**: DefTruth
-- **状态**: 已报告 (2 条评论)
-- **问题描述**: 
-  - 尝试导入 nvidia-cutlass-dsl v4.4.0.dev1 时出现错误
-  - 提供了 hello_world 示例代码，但错误信息被截断
-
-### V100 支持询问 (#3000)
-- **标题**: CUTLASS 是否支持 NVIDIA GPU Tesla V100？
-- **作者**: xxxxdddds
-- **状态**: 新报告 (0 条评论)
-- **问题描述**: 直接询问 CUTLASS 是否支持 Tesla V100 GPU
+提交：
+- v4.4 release update v2. (#2999) [`6b3e607`](https://github.com/NVIDIA/cutlass/commit/6b3e607b852f1543dc21323155a2ad71473c8642)
+- 受影响文件: CHANGELOG.md, README.md, examples/python/CuTeDSL/blackwell/dense_gemm_persistent_dynamic.py, examples/python/CuTeDSL/blackwell/sm103_dense_blockscaled_gemm_persistent.py, examples/python/CuTeDSL/experimental/ampere/memcpy_simt_universal_copy.py, examples/python/CuTeDSL/experimental/blackwell/dense_block_scaled_gemm.py, examples/python/CuTeDSL/experimental/blackwell/dense_gemm.py, examples/python/CuTeDSL/experimental/blackwell/dense_gemm_2sm.py, examples/python/CuTeDSL/experimental/blackwell/dense_gemm_cute_pipeline.py, examples/python/CuTeDSL/experimental/blackwell/dense_gemm_ptr_array.py, include/cutlass/gemm/kernel/sm100_gemm_array_tma_warpspecialized.hpp, include/cutlass/gemm/kernel/sm100_gemm_array_tma_warpspecialized_input_transform.hpp, include/cutlass/gemm/kernel/sm100_gemm_array_tma_warpspecialized_mma_transform.hpp, include/cutlass/gemm/kernel/sm100_tile_scheduler_group.hpp, include/cutlass/gemm/kernel/sm103_blockscaled_gemm_array_tma_warpspecialized.hpp, include/cutlass/gemm/kernel/sm90_gemm_array_tma_warpspecialized_cooperative.hpp
+- 文件列表已截断。
+Issues：
+- Performance overhead: Frequent cuTensorMapEncodeTiled and cudaGetDriverEntryPoint calls during Blackwell GEMM loops (https://github.com/NVIDIA/cutlass/issues/3003)
+- Issue 内容已截断。
+- [BUG] segmentation fault when calling `cute.print_tensor` on fp8 shared-memory tensor (https://github.com/NVIDIA/cutlass/issues/3002)
+- Issue 内容已截断。
+- [BUG] nvidia-cutlass-dsl v4.4.0.dev1 import error (https://github.com/NVIDIA/cutlass/issues/3001)
+- Issue 内容已截断。
+- [QST] is cutlass support on nvidia GPU Tesla V100 ? (https://github.com/NVIDIA/cutlass/issues/3000)
 ### flashinfer-ai/flashinfer
-# FlashInfer Newsletter - 2026-02-04
-
-## Notable Commits
-
-### [cdbb2c3] Fix permission errors in release workflow (#2488)
-- Removed `chown` commands and `--user` flag from docker run in nightly-release.yml and release.yml
-- [View commit](https://github.com/flashinfer-ai/flashinfer/commit/cdbb2c3c73598bbb04a0e2dc2d7cf6ee9e5aeda5)
-
-### [e284274] Support Fused MoE non gated Relu2 NVFP4 & FP8 and support Nemotron (#2462)
-- Added support for new activation types and quantization methods
-- Modified benchmarks/bench_trtllm_gen_fused_moe_autotuner.py to use ActivationType instead of GatedActType
-- Updated CUDA source files in csrc/ for MoE kernels
-- [View commit](https://github.com/flashinfer-ai/flashinfer/commit/e284274e2eb67538bb9c884f2ed9c0143772d3ac)
-
-### [9bf007d] Add/update multi node/multi GPU test scripts (#2410)
-- Added scripts/task_run_unit_tests.sh and scripts/task_test_multi_gpu_comm_kernels.sh
-- Removed scripts/task_test_blackwell_kernels.sh
-- Added test_utils.sh for common testing utilities
-- [View commit](https://github.com/flashinfer-ai/flashinfer/commit/9bf007d7403f0a394fda44abd4170b354cac3f05)
-
-### [567ded1] Rename tests/mamba/test_utils.py to tests/mamba/utils.py (#2481)
-- Fixed CI test discovery by renaming utility file
-- Updated imports in test_selective_state_update_mtp.py and test_selective_state_update_stp.py
-- [View commit](https://github.com/flashinfer-ai/flashinfer/commit/567ded1f612c38bd6a921a4a7ce4ecc6db2b9a9e)
-
-### [f84ac1c] Fix memory bandwidth calculation in MLA benchmarks (#2479)
-- Corrected memory bandwidth calculations in bench_trtllm_gen_mla.py
-- Updated attention.py benchmark routine
-- [View commit](https://github.com/flashinfer-ai/flashinfer/commit/f84ac1c97e2e1a4391150ca73971b973ee569e5a)
-
-### [6ae5bfe] Refactor: reduce hopper's gdn prefill compilation time (#2422)
-- Added flat_prefill_kernel_delta_rule_sm90_extern.inc and gdn_prefill_sm90_kernel_inst.jinja
-- Renamed prefill_kernel_delta_rule_sm90.cu to flat_prefill_kernel_delta_rule_sm90.cu
-- Reduced compilation time for Hopper's GDN prefill kernel
-- [View commit](https://github.com/flashinfer-ai/flashinfer/commit/6ae5bfe6a48c591a171f32888e5de28b9ca0207b)
-
-## Open Issues
-
-### Performance Issues
-- **#2496**: mxfp4 quantize kernel is 10x slower than nvfp4 quantize kernel (5.597 TFLOPs vs 0.442 TFLOPs)
-- **#2493**: Request for performance improvement in CuTe DSL GDN Decode Kernel
-- **#2491**: Request to add CuTe DSL backends for RoPE APIs
-
-### Bug Reports
-- **#2490**: GDN prefill kernel produces NaN values (body truncated)
-- **#2494**: XQA always sets dynamic smem size on rank 0, causing issues in multi-GPU environments
-- **#2486**: Illegal memory access in RadixTopKKernel_Unified
-- **#2485**: Accuracy issue with GLM-4.7 ModelOpt NVFP4 producing garbage output (body truncated)
+### Commits
+- [Fix permission errors in release workflow on ci-infra runner](https://github.com/flashinfer-ai/flashinfer/commit/cdbb2c3c73598bbb04a0e2dc2d7cf6ee9e5aeda5) - Yong Wu. Removed `chown` commands and `--user` flag in Docker workflows to resolve CI permission issues. Affected files: `.github/workflows/nightly-release.yml`, `.github/workflows/release.yml`.
+- [Support Fused MoE non-gated Relu2 NVFP4 & FP8 and Nemotron](https://github.com/flashinfer-ai/flashinfer/commit/e284274e2eb67538bb9c884f2ed9c0143772d3ac) - amitz-nv. Added FP8 block-scale MoE support and updated benchmarks. Key changes: `bench_trtllm_gen_fused_moe_autotuner.py` (added `ActivationType` handling), `trtllm_fused_moe_runner.cu` (routing logic). Diff truncated—see commit for full changes.
+- [Add/update multi-node/multi-GPU test scripts](https://github.com/flashinfer-ai/flashinfer/commit/9bf007d7403f0a394fda44abd4170b354cac3f05) - Jonathan Dierksen. Replaced `task_test_blackwell_kernels.sh` with new scripts: `task_run_unit_tests.sh`, `task_test_multi_gpu_comm_kernels.sh`, and `test_utils.sh`. Added shared utility functions.
+- [Rename tests/mamba/test_utils.py to fix CI test discovery](https://github.com/flashinfer-ai/flashinfer/commit/567ded1f612c38bd6a921a4a7ce4ecc6db2b9a9e) - Brian K. Ryu. Fixed test imports by renaming `test_utils.py` to `utils.py`. Updated references in `test_selective_state_update_*.py`.
+- [Fix memory bandwidth calculation in MLA benchmarks](https://github.com/flashinfer-ai/flashinfer/commit/f84ac1c97e2e1a4391150ca
 ### Dao-AILab/flash-attention
-## Flash-Attention 更新
-
-### 版本发布
-- **v3.0.0 稳定版发布** [PR #2223](https://github.com/Dao-AILab/flash-attention/pull/2223)
-  - Luca Wehrstedt 将主版本标记为 v3.0.0 稳定版
-  - 修改文件: `hopper/__init__.py`
-
-### 新功能
-- **Flex Flash 简化文档** [PR #2231](https://github.com/Dao-AILab/flash-attention/pull/2231)
-  - Markus Hoehnerbach 为 flex flash 添加了简短说明文档
-  - 新增文件: `flash_attn/cute/README.md` (26行新增)
-
-### 问题修复
-- **共享内存竞争修复** [PR #2229](https://github.com/Dao-AILab/flash-attention/pull/2229)
-  - Driss Guessous 修复了共享内存竞争问题
-  - 修改文件:
-    - `flash_attn/cute/block_sparse_utils.py`
-    - `flash_attn/cute/flash_fwd_sm100.py`
-
-- **依赖更新** [PR #2155](https://github.com/Dao-AILab/flash-attention/pull/2155)
-  - Jane (Yuan) Xu 将 TORCH_STABLE_ONLY 替换为 TORCH_TARGET_VERSION
-  - 修改文件: `hopper/setup.py`
+- 标记Flash Attention 3主版本为v3.0.0稳定版（PR [#2223](https://github.com/Dao-AILab/flash-attention/pull/2223)），由Luca Wehrstedt于2026-02-05提交。修改文件：`hopper/__init__.py`（1行添加，1行删除）。注意：diff截断，无法显示完整代码。
+- 为flex flash添加简短README文档（PR [#2231](https://github.com/Dao-AILab/flash-attention/pull/2231)），由Markus Hoehnerbach于2026-02-05提交。修改文件：`flash_attn/cute/README.md`（26行添加）。注意：diff截断。
+- 在构建配置中用`TORCH_TARGET_VERSION`替换`TORCH_STABLE_ONLY`（PR [#2155](https://github.com/Dao-AILab/flash-attention/pull/2155)），由Jane (Yuan) Xu于2026-02-04提交。修改文件：`hopper/setup.py`（1行添加，1行删除）。注意：diff截断。
+- 修复共享内存竞争条件（PR [#2229](https://github.com/Dao-AILab/flash-attention/pull/2229)），由Driss Guessous于2026-02-04提交。修改文件：`flash_attn/cute/block_sparse_utils.py`（1行添加，1行删除）和`flash_attn/cute/flash_fwd_sm100.py`（3行添加，3行删除）。注意：diff截断。
 ### sgl-project/sglang
-# SGLang 项目更新 (2026-02-04)
+# SGLang Newsletter - 2026-02-04
 
-## 主要性能优化
+## Core Improvements
 
-- **优化 get_topk_ragged 性能** (#760ae93): 通过融合 get k 和 k_scale triton 内核，显著提升性能
-- **改进 MHA 模型的 KV 偏移计算** (#f730c18): 优化不同张量并行度下的内存访问效率
-- **融合 qkvbfg 线性操作** (#37c33cc): 将多个线性操作合并为单个 GEMM，提升计算效率
-- **添加快速预热标志** (#d279520): 为 DeepGemm 添加快速预热选项，减少启动时间
-- **核融合优化** (#4739f2e): 为 Qwen-Image、WAN 和 HunyuanVideo 实现门控残差层归一化尺度偏移核融合
+- **Layerwise Offload for MoVA** ([dff3ba2](https://github.com/sgl-project/sglang/commit/dff3ba202ad034630a8faa53ae6550a06b981e90)): Added support for layerwise offloading in MoVA models to optimize memory usage.
 
-## 新功能与模型支持
+- **InternS1-Pro Model Support** ([3e7ecb7](https://github.com/sgl-project/sglang/commit/3e7ecb78a60f8e1d889cfe25c88006577783d903)): Added support for the InternS1-Pro model with new model implementation and multimodal processor.
 
-- **支持 InternS1-Pro 模型** (#3e7ecb7): 添加新模型支持，包含 580 行代码变更
-- **支持 π/π-FAST VLA 模型推理** (#18266): 添加机器人基础策略模型推理支持
-- **支持按请求传递 spaces_between_special_tokens** (#a6f53cc): 增强 API 灵活性
-- **添加 MoE 融合配置** (#efbf395): 为 Qwen3-Coder-Next-FP8 在 H100 TP=2 上添加配置
+- **Linear Layer Fusion** ([37c33cc](https://github.com/sgl-project/sglang/commit/37c33cc0aa6213fd4abcfb40c3e1d71dde484295)): Implemented fusion of qkvbfg linear operations into single GEMM and f_b g_b into batched GEMM for improved performance.
 
-## Bug 修复与优化
+- **TopK Ragged Optimization** ([760ae93](https://github.com/sgl-project/sglang/commit/760ae933bb3878a6897e7e552a746929c29e9d90)): Optimized get_topk_ragged by fusing get k and k_scale operations in a Triton kernel.
 
-- **修复连续动态请求下的服务器缓存 DIT 错误** (#da758ed): 解决缓存管理问题
-- **修复多模态 Session 问题** (#c1d529c): 暴露 Session 通过 Engine，修复多模态处理
-- **修复 Kimi K2.5 的 MoE GEMM 配置初始化** (#599c5f4): 解决模型配置问题
-- **修复注意力测试中的 MockModelRunner** (#2e87c2b): 确保测试正确性
-- **修复 GPU-0 上的冗余内存使用** (#4c40304): 优化内存分配
-- **修复 AITER 注意力中的 OOM 错误** (#18262): 解决内存管理问题
+## Diffusion Enhancements
 
-## 文档更新
+- **Kernel Fusion for Diffusion Models** ([4739f2e](https://github.com/sgl-project/sglang/commit/4739f2e8d5732f7464d1af75d31b4d44c61783b6)): Implemented gated residual layernorm scale shift and layernorm scale shift kernel fusion for Qwen-Image, WAN and HunyuanVideo models.
 
-- **支持 Markdown/Notebook 友好的文档导出** (#e616d35, #669a9bd): 添加文档格式转换功能
-- **修复文档拼写错误** (#de6a032): 更新多个文档文件中的拼写错误
-- **添加 SGLANG_MOONCAKE_CUSTOM_MEM_POOL 文档** (#c8212b9): 记录环境变量支持
-- **修复 README 拼写错误** (#1f72f66): 更新项目主文档
+- **MOVA Code Cleanup** ([0c9a0ad](https://github.com/sgl-project/sglang/commit/0c9a0adc5329d393435097337fa113174363299e)): Cleaned up MOVA code by removing redundant implementations in audio and video DIT models.
 
-## 社区问题与请求
+- **GPU Memory Fix** ([4c40304](https://github.com/sgl-project/sglang/commit/4c403045ec690dbcf3b63a941356e004201ba337)): Fixed redundant memory usage on GPU-0 in the diffusion module.
 
-- **更新投机解码文档** (#18268): 需要记录新的 SGLANG_ENABLE_SPEC_V2 功能
-- **添加分段 CUDA 图文档** (#18267): 需要为性能功能添加文档
-- **集成 FA4 SM90 解码** (#18265): 开发 FA4 在 SM90 上的实现
-- **验证 FA4 在注意力后端兼容性** (#18264): 更新兼容性文档
-- **解释如何使用 NVIDIA ModelOpt 检查点** (#18261): 添加 ModelOpt 工作流程文档
-- **支持 ModelOpt 的 MXFP8 加载器** (#18258): 添加 ModelOpt PTQ MXFP8 支持
+## Platform Support
+
+- **AMD GPU Improvements** ([6fd878b](https://github.com/sgl-project/sglang/commit/6fd878b41df0153bd28f0185920e1b2d9dcc7480)): Added Kimi MI35X nightly tests, reorganized test folders, and implemented stability fixes for AMD GPUs.
+
+- **NPU Allocator Refactoring** ([84c0991](https://github.com/sgl-project/sglang/commit/84c09913eb1458278f62f9dc393007141d3b67c3)): Moved _alloc_extend_naive out of NPU allocator to improve memory management.
+
+## Documentation & Usability
+
+- **Markdown Documentation Export** ([e616d35](https://github.com/sgl-project/sglang/commit/e616d3584737686f6d221ce3f21c67b98a936827), [669a9bd](https://github.com/sgl-project/sglang/commit/669a9bd1809a344fae5b9d962d2cd6f842cb50c1)): Enhanced documentation export to support Markdown/Notebook-friendly formats for downstream integration.
+
+- **Special Tokens Support** ([a6f53cc](https://github.com/sgl-project/sglang/commit/a6f53cc5e3ac7eb8ae9e4236d9834897684505ad)): Added support for passing spaces_between_special_tokens per request in the OpenAI API protocol.
+
+- **Documentation Fixes** ([de6a032](https://github.com/sgl-project/sglang/commit/de6a03260f59fd33a9eeb8f67e7e6e2cf235a70f)): Fixed misspellings and typos across multiple documentation files.
+
+## Performance Optimizations
+
+- **KV Offset Calculation Improvement** ([f730c18](https://github.com/sgl-project/sglang/commit/f730c186799d966a62531269ce46178364c85dc3)): Enhanced KV offset calculation for MHA models with different tensor parallel sizes.
+
+- **Memory Management Fix** ([315306d](https://github.com/sgl-project/sglang/commit/315306d8a9f93ed24e3a6d532b3c1da41e83ca9d)): Ensured symmetric memory is disabled without dp padding to prevent unnecessary memory usage.
+
+- **DeepGemm Fast Warmup** ([d279520](https://github.com/sgl-project/sglang/commit/d279520ba5771e0bd361c6a762b653391bb1bc09)): Added a flag for fast warmup in DeepGemm to reduce initialization time.
+
+## Bug Fixes
+
+- **Test Fixes** ([c910829](https://github.com/sgl-project/sglang/commit/c910829708c7b71f82e646393c6503b17501e396), [2e87c2b](https://github.com/sgl-project/sglang/commit/2e87c2bd5e43bfad57150ff878761bc6cffc0ab8)): Fixed tests for routed experts and MockModelRunner in attention tests.
+
+- **Session Fix for Multimodal** ([c1d529c](https://github.com/sgl-project/sglang/commit/c1d529c19605cbf1f9be8db6d6d225b1465ea2e0)): Fixed Session handling for multimodal models and exposed it through the Engine.
+
+- **Logic Error Fix** ([c1d5cc3](https://github.com/sgl-project/sglang/commit/c1d5cc3b24ada6857bc32af13e0a0528a01fcb70)): Fixed an obvious logic error in pyproject.toml files.
+
+## Notable Issues
+
+- **Speculative Decoding Documentation** ([#18268](https://github.com/sgl-project/sglang/issues/18268)): Need to update documentation to include SGLANG_ENABLE_SPEC_V2 and ngram support.
+
+- **Piecewise CUDA Graph Documentation** ([#18267](https://github.com/sgl-project/sglang/issues/18267)): Request for documentation of the --enable-piecewise-cuda-graph feature.
+
+- **Pi0 VLA Model Support** ([#18266](https://github.com/sgl-project/sglang/issues/18266)): Feature request for adding Pi0/Pi0-FAST VLA model inference support for robotics.
+
+- **FA4 SM90 Decode Integration** ([#18265](https://github.com/sgl-project/sglang/issues/18265)): Integration of FA4 SM90 Decode, currently 20% slower than FA3.
+
+- **AITER Attention OOM Errors** ([#18262](https://github.com/sgl-project/sglang/issues/18262)): OOM errors due to max_total_num_tokens not accounting for attention backend memory requirements.
 ### vllm-project/vllm
-## vLLM Updates - February 4, 2026
-
-### New Features
-- **ColBERT late interaction model support** ([#33686](https://github.com/vllm-project/vllm/pull/33686)): Added ColBERT model support with new implementation in `vllm/model_executor/models/colbert.py`
-
-### Performance Improvements
-- **Chat completion streaming optimization** ([#33782](https://github.com/vllm-project/vllm/pull/33782)): Enhanced streaming performance in `vllm/entrypoints/openai/chat_completion/serving.py`
-- **Spec decoding optimization** ([#33612](https://github.com/vllm-project/vllm/pull/33612)): 1.5% throughput improvement via async scheduler optimizations
-- **GDN Attention State Layout optimization** ([#33291](https://github.com/vllm-project/vllm/pull/33291)): Changed layout from [N, HV, K, V] to [N, HV, V, K] for better performance
-- **Zero-copy GQA implementation** ([#33732](https://github.com/vllm-project/vllm/pull/33732)): Improved memory efficiency for multimodal and CPU processing
-
-### Bug Fixes
-- **DeepSeek R1 MLA fix** ([#33637](https://github.com/vllm-project/vllm/pull/33637)): Fixed DeepSeek R1 with CUTLASS MLA on B200 GPUs
-- **TRTLLM attention conflict** ([#33192](https://github.com/vllm-project/vllm/pull/33192)): Disabled TRTLLM attention when KV transfer is enabled
-- **MCP tools non-streaming mode** ([#32762](https://github.com/vllm-project/vllm/pull/32762)): Fixed McpCall return for built-in MCP tools
-- **Qwen audio-in-video support** ([#33605](https://github.com/vllm-project/vllm/pull/33605)): Fixed audio support for Qwen2.5-Omni and Qwen3-Omni
-- **Interns1-pro initialization** ([#33793](https://github.com/vllm-project/vllm/pull/33793)): Fixed initialization and pipeline parallelism issues
-- **ROCm float8_e4m3fnuz support** ([#33713](https://github.com/vllm-project/vllm/pull/33713)): Added missing data type to NCCL dispatching
-
-### Model Enhancements
-- **Qwen3-Omni transcription** ([#29828](https://github.com/vllm-project/vllm/pull/29828)): Enhanced transcription capabilities
-- **RotaryEmbedding CustomOp** ([#33800](https://github.com/vllm-project/vllm/pull/33800)): Added support for gpt-oss models
-
-### Infrastructure Updates
-- **XPU unquantized MoE support** ([#33659](https://github.com/vllm-project/vllm/pull/33659)): Added XPU platform support for unquantized MoE
-- **Ray device visibility unification** ([#33308](https://github.com/vllm-project/vllm/pull/33308)): Fixed device handling across CUDA and ROCm
-- **ORJSONResponse integration** ([#33548](https://github.com/vllm-project/vllm/pull/33548)): Improved request processing efficiency
-
-### Reverted Changes
-- **FA3 swizzle optimization** ([#33841](https://github.com/vllm-project/vllm/pull/33841)): Reverted recent changes to flash attention backend
-- **torch.compile cold start** ([#33820](https://github.com/vllm-project/vllm/pull/33820)): Reverted cold start time optimizations
-
-### Notable Issues
-- Docker image compatibility issues with Qwen3-Next and FP8 GEMM settings
-- DeepSeek V3.2 benchmark failures
-- Mistral3 multimodal inference errors
-- Pipeline parallelism issues with Step3p5ForCausalLM
+提交：
+- [CI/Build] Parallelize CPU CI tests (#33778) [`07daee1`](https://github.com/vllm-project/vllm/commit/07daee132b30140bb7c5b28d7f8c856036d2baad)
+- 受影响文件: .buildkite/hardware_tests/arm.yaml, .buildkite/hardware_tests/cpu.yaml, .buildkite/hardware_tests/intel.yaml, .buildkite/scripts/hardware_ci/run-cpu-distributed-smoke-test.sh, .buildkite/scripts/hardware_ci/run-cpu-test.sh, vllm/v1/worker/cpu_worker.py
+- [2/N] move responses/serving _make_response_output_items logic to parser (#33281) [`9595afd`](https://github.com/vllm-project/vllm/commit/9595afda183bdd79b0ee2d38d2b0049fe86e6628)
+- 受影响文件: vllm/entrypoints/openai/responses/serving.py, vllm/parser/abstract_parser.py
+- [CI][AMD][BugFix] Ensure VLLM_ROCM_USE_AITER is set so test_rocm_aiter_topk.py can run correctly (#33840) [`c1395f7`](https://github.com/vllm-project/vllm/commit/c1395f72cd22d97eb39ecd67d9d22f2af3d20bda)
+- 受影响文件: tests/kernels/moe/test_rocm_aiter_topk.py
+- [docs] fix unintentional misspellings (#33863) [`007b183`](https://github.com/vllm-project/vllm/commit/007b183d745f5b37aeb6cdf936c3b590b0c29fde)
+- 受影响文件: docs/contributing/model/basic.md, docs/contributing/model/multimodal.md, docs/getting_started/quickstart.md
+- [Minor] Include `StreamingInput` in inputs package (#33856) [`add9f1f`](https://github.com/vllm-project/vllm/commit/add9f1fbd920611c2b909fe10d9b44b59650f8b7)
+- 受影响文件: tests/v1/e2e/test_streaming_input.py, tests/v1/streaming_input/test_async_llm_streaming.py, vllm/inputs/__init__.py, vllm/v1/engine/async_llm.py
+- Revert "[Attention][FA3] Update FA3 to include new swizzle optimization" (#33841) [`e3bf79f`](https://github.com/vllm-project/vllm/commit/e3bf79ffa080a5052aa61fce71b70b11fb7f9d1e)
+- 受影响文件: cmake/external_projects/vllm_flash_attn.cmake, vllm/v1/attention/backends/flash_attn.py, vllm/v1/attention/backends/mla/flashattn_mla.py
+- [CI][Bugfix]: return McpCall for built-in MCP tools in non-streaming mode (#32762) [`fb1270f`](https://github.com/vllm-project/vllm/commit/fb1270f1f821603402a8868e3067b3c3342455e7)
+- 受影响文件: tests/entrypoints/openai/responses/test_harmony.py, tests/entrypoints/openai/responses/test_mcp_tools.py, tests/entrypoints/openai/responses/test_parsable_context.py, tests/entrypoints/openai/responses/test_simple.py, tests/utils.py, vllm/entrypoints/openai/parser/harmony_utils.py
+- [release] Minor fixes to release annotation (#33849) [`72bb24e`](https://github.com/vllm-project/vllm/commit/72bb24e2db2acd98a49adcb9e3f1dc6f1bbef4c0)
+- 受影响文件: .buildkite/scripts/annotate-release.sh
+- [Bugfix] fix DeepSeek R1 with CUTLASS MLA Broken on B200 (#33637) [`a7be77b`](https://github.com/vllm-project/vllm/commit/a7be77beef5f59d9d349818b4f2860483551b255)
+- 受影响文件: vllm/model_executor/layers/attention/mla_attention.py
+- [Bugfix] Disable TRTLLM attention when KV transfer is enabled (#33192) [`bbe0574`](https://github.com/vllm-project/vllm/commit/bbe0574d8e51c1c5935aeff9e92040c61d1d59c5)
+- 受影响文件: vllm/v1/attention/backends/flashinfer.py
+- [CI][torch.compile] Reduce e2e fusion test time (#33293) [`4d95135`](https://github.com/vllm-project/vllm/commit/4d9513537d00a9b6678a2b1ed3c3566a81f7dd77)
+- 受影响文件: .buildkite/test-amd.yaml, .buildkite/test-pipeline.yaml, .buildkite/test_areas/compile.yaml, .buildkite/test_areas/distributed.yaml, .buildkite/test_areas/pytorch.yaml, tests/compile/distributed/test_fusions_e2e.py, tests/compile/fusion_test_utils.py, tests/compile/fusions_e2e/__init__.py, tests/compile/fusions_e2e/common.py, tests/compile/fusions_e2e/conftest.py, tests/compile/fusions_e2e/models.py, tests/compile/fusions_e2e/test_tp1_quant.py, tests/compile/fusions_e2e/test_tp2_ar_rms.py, tests/compile/fusions_e2e/test_tp2_async_tp.py, tests/compile/test_fusion_attn.py, tests/test_config.py
+- 文件列表已截断。
+- feat: Add ColBERT late interaction model support (#33686) [`439afa4`](https://github.com/vllm-project/vllm/commit/439afa4eea14db2be232a9ce78eacc2c7bbfac77)
+- 受影响文件: docs/models/pooling_models.md, examples/pooling/score/colbert_rerank_online.py, tests/entrypoints/pooling/score/test_online_colbert.py, tests/models/language/pooling/test_colbert.py, tests/models/registry.py, vllm/config/model.py, vllm/entrypoints/llm.py, vllm/entrypoints/pooling/__init__.py, vllm/entrypoints/pooling/score/serving.py, vllm/entrypoints/pooling/score/utils.py, vllm/model_executor/models/colbert.py, vllm/model_executor/models/interfaces.py, vllm/model_executor/models/registry.py
+- [Core] Don't schedule spec tokens with prefill chunks (#33652) [`fa4e0fb`](https://github.com/vllm-project/vllm/commit/fa4e0fb028460cf5f4eb9cc90e206d0d6f35b026)
+- 受影响文件: tests/v1/core/test_scheduler.py, vllm/v1/core/sched/async_scheduler.py, vllm/v1/core/sched/scheduler.py, vllm/v1/request.py, vllm/v1/worker/gpu/spec_decode/utils.py
+- Change the type signature of MixtureOfExperts.expert_weights to MutableSequence[Sequence[Tensor]] (#33573) [`ce498a6`](https://github.com/vllm-project/vllm/commit/ce498a6d61a083b1bbbd1cc92754961b43860ff6)
+- 受影响文件: vllm/distributed/eplb/rebalance_execute.py, vllm/model_executor/models/interfaces.py
+- Revert "[torch.compile] Significantly speed up cold start times" (#33820) [`9f14c92`](https://github.com/vllm-project/vllm/commit/9f14c9224d3d6664e2f5a2e7fecd012fd048fcb1)
+- 受影响文件: tests/compile/test_cold_start.py, vllm/compilation/backends.py, vllm/compilation/compiler_interface.py
+- [Model] Add transcription support for Qwen3-Omni (#29828) [`535de06`](https://github.com/vllm-project/vllm/commit/535de06cb1d90ed1c48246a512e74c87fe1768e4)
+- 受影响文件: docs/contributing/model/transcription.md, docs/models/supported_models.md, vllm/model_executor/models/qwen3_omni_moe_thinker.py
+- [Bugfix] Support `RotaryEmbedding` CustomOp for gpt-oss (#33800) [`4292c90`](https://github.com/vllm-project/vllm/commit/4292c90a2a188121ccbfd132def62031283d9d8a)
+- 受影响文件: tests/compile/test_rotary_embedding_compile.py, vllm/model_executor/layers/rotary_embedding/base.py, vllm/model_executor/layers/rotary_embedding/deepseek_scaling_rope.py, vllm/model_executor/layers/rotary_embedding/mrope.py
+- Implement zero-copy GQA for multimodal and CPU (#33732) [`6e98f6d`](https://github.com/vllm-project/vllm/commit/6e98f6d8b64984d5e3a8a9b323321f1095bac8b3)
+- 受影响文件: vllm/model_executor/layers/attention/mm_encoder_attention.py, vllm/model_executor/models/molmo2.py, vllm/v1/attention/backends/cpu_attn.py, vllm/v1/attention/ops/vit_attn_wrappers.py
+- [rocm][ray] Fix: Unify Ray device visibility handling across CUDA and ROCm (#33308) [`2f6d17c`](https://github.com/vllm-project/vllm/commit/2f6d17cb2f4a49e29aae5c3c1ff64623d66d0257)
+- 受影响文件: docker/Dockerfile.rocm, tests/config/test_config_generation.py, vllm/platforms/cuda.py, vllm/platforms/interface.py, vllm/platforms/rocm.py, vllm/v1/executor/ray_executor.py, vllm/v1/worker/gpu_worker.py, vllm/v1/worker/worker_base.py
+- [Bugfix] Fix interns1-pro initialization and PP (#33793) [`192ad46`](https://github.com/vllm-project/vllm/commit/192ad4648b2066ebdf1fa04ad84f24bdf0cd6533)
+- 受影响文件: tests/models/multimodal/processing/test_common.py, tests/models/multimodal/processing/test_tensor_schema.py, tests/models/registry.py, vllm/model_executor/models/interns1_pro.py, vllm/model_executor/models/qwen3_vl.py, vllm/model_executor/models/qwen3_vl_moe.py
+- [Misc] Delay deprecation of CommonAttentionMetadata properties (#33801) [`0e92298`](https://github.com/vllm-project/vllm/commit/0e922986222d9c25ce320fbdd0aff20279c2cb93)
+- 受影响文件: vllm/v1/attention/backend.py
+- [Bugfix] Fix ubatch wrapper num_tokens calculate (#33694) [`87d9a26`](https://github.com/vllm-project/vllm/commit/87d9a261664705e0c9635014b4e2d49eddc8a056)
+- 受影响文件: vllm/v1/worker/gpu_ubatch_wrapper.py
+- [Bugfix] Fix `normalize` still being passed to `PoolerConfig` (#33794) [`80f921b`](https://github.com/vllm-project/vllm/commit/80f921ba4bab2ea251d149305ea0f912c6fc218a)
+- 受影响文件: tests/models/language/pooling/test_embedding.py, vllm/entrypoints/llm.py
+- [Perf] Optimize spec decoding + async scheduling, 1.5% Throughput improvement (#33612) [`711edaf`](https://github.com/vllm-project/vllm/commit/711edaf0d089a15df5fa2b99248c516e53929bd2)
+- 受影响文件: vllm/v1/core/sched/async_scheduler.py, vllm/v1/core/sched/scheduler.py
+- [Bugfix][ROCm] Include float8_e4m3fnuz in NCCL Dtype Dispatching (#33713) [`1d367a7`](https://github.com/vllm-project/vllm/commit/1d367a738e9098ad4af1f6865747914ccd2c65ca)
+- 受影响文件: vllm/distributed/device_communicators/pynccl_wrapper.py
+- Apply #33621 to main (#33758) [`32a02c7`](https://github.com/vllm-project/vllm/commit/32a02c7ca29180f70c1c8c73d0f57445231b17b5)
+- 受影响文件: requirements/common.txt, requirements/rocm-test.txt, requirements/test.txt
+- [Perf] Optimize chat completion streaming performance (#33782) [`f67ee8b`](https://github.com/vllm-project/vllm/commit/f67ee8b859215df4b521c67b9f26e27f30c9739f)
+- 受影响文件: vllm/entrypoints/openai/chat_completion/serving.py
+- [Model] Apply #32631 for recent models (#33785) [`e57ef99`](https://github.com/vllm-project/vllm/commit/e57ef99b409ba651695a515f6022c9badf25b2a2)
+- 受影响文件: vllm/model_executor/models/eagle2_5_vl.py, vllm/model_executor/models/funaudiochat.py, vllm/model_executor/models/openpangu_vl.py, vllm/model_executor/models/qwen3_asr.py
+- [Bugfix][Model] Fix audio-in-video support for Qwen2.5-Omni and Qwen3-Omni       (#33605) [`f8516a1`](https://github.com/vllm-project/vllm/commit/f8516a1ab95febcf131a37478914031f50fdd9db)
+- 受影响文件: vllm/model_executor/models/qwen2_5_omni_thinker.py, vllm/model_executor/models/qwen3_omni_moe_thinker.py
+- [PERF] Change GDN Attention State Layout from [N, HV, K, V] to [N, HV, V, K] (#33291) [`8240580`](https://github.com/vllm-project/vllm/commit/824058076c56164a3772a5f5829bd9662507e5a3)
+- 受影响文件: vllm/model_executor/layers/fla/ops/chunk.py, vllm/model_executor/layers/fla/ops/chunk_delta_h.py, vllm/model_executor/layers/fla/ops/chunk_o.py, vllm/model_executor/layers/fla/ops/fused_recurrent.py, vllm/model_executor/layers/fla/ops/kda.py, vllm/model_executor/layers/mamba/mamba_utils.py
+- [KV Connector][BugFix] scheduler: Delay freeing blocks of aborted async loads (#32255) [`8e32690`](https://github.com/vllm-project/vllm/commit/8e3269086916d81b010a2d6209784a106ac2994a)
+- 受影响文件: tests/v1/core/test_scheduler.py, tests/v1/kv_connector/unit/test_offloading_connector.py, vllm/v1/core/sched/scheduler.py
+- [compile] Remove runner type from ignored caching factor list. (#33712) [`a208439`](https://github.com/vllm-project/vllm/commit/a208439537a9071668b99dc8089db0dd8995034a)
+- 受影响文件: vllm/config/model.py
+Issues：
+- [Bug][Docker]: Issues with 0.15.0 and newer docker image when running Qwen3-Next with VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=1 (https://github.com/vllm-project/vllm/issues/33833)
+- Issue 内容已截断。
+- [Bug]: Deepseek V3.2 Benchmark failure "TypeError: argument 'tokens': 'NoneType' object" (https://github.com/vllm-project/vllm/issues/33831)
+- Issue 内容已截断。
+- [Bug]: mistral3 offline multimodal inference example failing with prompt placeholder error (https://github.com/vllm-project/vllm/issues/33828)
+- Issue 内容已截断。
+- [Bug]: Step3p5ForCausalLM fails with pipeline parallelism (https://github.com/vllm-project/vllm/issues/33823)
+- Issue 内容已截断。
+- [CI Failure]: Quantized Models Test in `tests/models/quantization/test_gptq_marlin.py::test_models[5-32-bfloat16-model2]` (https://github.com/vllm-project/vllm/issues/33816)
+- Issue 内容已截断。
+- [Bug]: llm.score() fails on batched multimodal input for qwen3-vl-reranker (https://github.com/vllm-project/vllm/issues/33813)
+- Issue 内容已截断。
+- [CI Failure]:  mi325_4: LM Eval Large Models (H100) (https://github.com/vllm-project/vllm/issues/33812)
+- Issue 内容已截断。
+- [CI Failure]:  Kernels MoE Test %N (https://github.com/vllm-project/vllm/issues/33809)
+- Issue 内容已截断。
 ### NVIDIA/cutile-python
 昨日无更新。
 
 ## 总结
 - Diff 内容已截断以满足 prompt 预算。
 - Issue 内容已截断以满足 prompt 预算。
-- OpenRouter repo summarize failed for NVIDIA/cutlass with qwen/qwen3-coder:free: OpenRouter 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"Venice","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
-- OpenRouter repo summarize failed for NVIDIA/cutlass with openai/gpt-oss-120b:free: OpenRouter 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"openai/gpt-oss-120b:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"OpenInference","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
-- OpenRouter repo summarize failed for flashinfer-ai/flashinfer with qwen/qwen3-coder:free: OpenRouter 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"Venice","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
-- OpenRouter repo summarize failed for flashinfer-ai/flashinfer with openai/gpt-oss-120b:free: OpenRouter 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"openai/gpt-oss-120b:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"OpenInference","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
-- OpenRouter repo summarize failed for Dao-AILab/flash-attention with qwen/qwen3-coder:free: OpenRouter 402 Payment Required: {"error":{"message":"Provider returned error","code":402,"metadata":{"raw":"{\"error\":\"API key USD spend limit exceeded. Your account may still have USD balance, but this API key has reached its configured USD spending limit.\"}","provider_name":"Venice","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
-- OpenRouter repo summarize failed for Dao-AILab/flash-attention with openai/gpt-oss-120b:free: OpenRouter 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"openai/gpt-oss-120b:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"OpenInference","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
-- OpenRouter repo summarize failed for sgl-project/sglang with qwen/qwen3-coder:free: OpenRouter 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"Venice","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
-- OpenRouter repo summarize failed for sgl-project/sglang with openai/gpt-oss-120b:free: OpenRouter 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"openai/gpt-oss-120b:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"OpenInference","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
-- OpenRouter repo summarize failed for vllm-project/vllm with qwen/qwen3-coder:free: OpenRouter 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"Venice","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
-- OpenRouter repo summarize failed for vllm-project/vllm with openai/gpt-oss-120b:free: OpenRouter 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"openai/gpt-oss-120b:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"OpenInference","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
-- OpenRouter global summarize failed for qwen/qwen3-coder:free: OpenRouter 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"Venice","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
-- OpenRouter global summarize failed for openai/gpt-oss-120b:free: OpenRouter 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"openai/gpt-oss-120b:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"OpenInference","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
+- OpenRouter repo summarize failed for NVIDIA/cutlass: OpenRouter 402 Payment Required (qwen/qwen3-coder:free): {"error":{"message":"Provider returned error","code":402,"metadata":{"raw":"{\"error\":\"API key USD spend limit exceeded. Your account may still have USD balance, but this API key has reached its configured USD spending limit.\"}","provider_name":"Venice","is_byok":false}},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
+- OpenRouter repo summarize failed for vllm-project/vllm: OpenRouter 404 Not Found (moonshotai/kimi-k2:free): {"error":{"message":"No endpoints found for moonshotai/kimi-k2:free.","code":404},"user_id":"user_2wqU29q2Bhpw2S2iw7Pwn8RHaXB"}
