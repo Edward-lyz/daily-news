@@ -1,7 +1,7 @@
 import datetime
 import json
 import os
-import random
+import time
 from typing import Any, Dict, List, Tuple
 
 import requests
@@ -218,9 +218,12 @@ def openrouter_summarize(
         {"role": "user", "content": prompt},
     ]
     attempts = max(1, retry_max)
-    last_error = ""
     for attempt in range(attempts):
-        model = random.choice(models)
+        if attempt == 0 or len(models) <= 1:
+            model = models[0]
+        else:
+            fallback_models = models[1:]
+            model = fallback_models[(attempt - 1) % len(fallback_models)]
         body = {
             "model": model,
             "messages": base_messages,
@@ -229,19 +232,16 @@ def openrouter_summarize(
         response = requests.post(url, headers=headers, json=body, timeout=60)
         if response.ok:
             data = response.json()
-            return data["choices"][0]["message"]["content"]
+            content = data["choices"][0]["message"]["content"]
+            time.sleep(60)
+            return content
         detail = truncate_text(response.text.strip(), 2000)
-        retriable = response.status_code in {429, 500, 502, 503, 504}
-        if retriable and attempt < attempts - 1:
-            last_error = (
-                f"OpenRouter {response.status_code} {response.reason} ({model}): {detail}"
-            )
+        time.sleep(60)
+        if attempt < attempts - 1:
             continue
         raise RuntimeError(
             f"OpenRouter {response.status_code} {response.reason} ({model}): {detail}"
         )
-    if last_error:
-        raise RuntimeError(last_error)
     raise RuntimeError("OpenRouter summarize failed: retry budget exhausted.")
 
 

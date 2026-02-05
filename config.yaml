@@ -19,8 +19,8 @@ github:
 openrouter:
   # Choose free/low-cost models to try in order.
   models:
-    - "qwen/qwen3-coder:free"
     - "openai/gpt-oss-120b:free"
+    - "qwen/qwen3-coder:free"
     - "z-ai/glm-4.5-air:free"
     - "moonshotai/kimi-k2:free"
     - "deepseek/deepseek-r1-0528:free"
