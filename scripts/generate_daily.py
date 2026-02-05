@@ -1,7 +1,7 @@
 import datetime
 import json
 import os
-import time
+import random
 from typing import Any, Dict, List, Tuple
 
 import requests
@@ -202,7 +202,7 @@ def fetch_github_issues(
 
 
 def openrouter_summarize(
-    prompt: str, model: str, retry_max: int, retry_base_seconds: int
+    prompt: str, models: List[str], retry_max: int, retry_base_seconds: int
 ) -> str:
     key = os.environ["OPENROUTER_API_KEY"]
     url = "https://openrouter.ai/api/v1/chat/completions"
@@ -210,19 +210,22 @@ def openrouter_summarize(
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
-    body = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a concise AI infra newsletter editor. Output Markdown only.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-    }
+    base_messages = [
+        {
+            "role": "system",
+            "content": "You are a concise AI infra newsletter editor. Output Markdown only.",
+        },
+        {"role": "user", "content": prompt},
+    ]
     attempts = max(1, retry_max)
+    last_error = ""
     for attempt in range(attempts):
+        model = random.choice(models)
+        body = {
+            "model": model,
+            "messages": base_messages,
+            "temperature": 0.2,
+        }
         response = requests.post(url, headers=headers, json=body, timeout=60)
         if response.ok:
             data = response.json()
@@ -230,16 +233,15 @@ def openrouter_summarize(
         detail = truncate_text(response.text.strip(), 2000)
         retriable = response.status_code in {429, 500, 502, 503, 504}
         if retriable and attempt < attempts - 1:
-            retry_after = response.headers.get("Retry-After", "").strip()
-            if retry_after.isdigit():
-                delay = int(retry_after)
-            else:
-                delay = retry_base_seconds * (2**attempt)
-            time.sleep(min(delay, 60))
+            last_error = (
+                f"OpenRouter {response.status_code} {response.reason} ({model}): {detail}"
+            )
             continue
         raise RuntimeError(
-            f"OpenRouter {response.status_code} {response.reason}: {detail}"
+            f"OpenRouter {response.status_code} {response.reason} ({model}): {detail}"
         )
+    if last_error:
+        raise RuntimeError(last_error)
     raise RuntimeError("OpenRouter summarize failed: retry budget exhausted.")
 
 
@@ -538,17 +540,14 @@ def main() -> None:
         if openrouter_key:
             prompt = build_repo_prompt(date_str, repo, repo_commits, repo_issues)
             repo_summary = ""
-            for model in models:
-                try:
-                    repo_summary = openrouter_summarize(
-                        prompt, model, retry_max, retry_base_seconds
-                    )
-                    if repo_summary:
-                        break
-                except Exception as exc:  # noqa: BLE001 - want a single fallback path
-                    errors.append(
-                        f"OpenRouter repo summarize failed for {repo} with {model}: {exc}"
-                    )
+            try:
+                repo_summary = openrouter_summarize(
+                    prompt, models, retry_max, retry_base_seconds
+                )
+            except Exception as exc:  # noqa: BLE001 - want a single fallback path
+                errors.append(
+                    f"OpenRouter repo summarize failed for {repo}: {exc}"
+                )
             if repo_summary:
                 repo_sections[repo] = repo_summary.strip()
                 continue
@@ -564,17 +563,12 @@ def main() -> None:
         ]
         prompt = build_global_prompt(date_str, repo_payload, repos_without_updates)
         global_output = ""
-        for model in models:
-            try:
-                global_output = openrouter_summarize(
-                    prompt, model, retry_max, retry_base_seconds
-                )
-                if global_output:
-                    break
-            except Exception as exc:  # noqa: BLE001 - want a single fallback path
-                errors.append(
-                    f"OpenRouter global summarize failed for {model}: {exc}"
-                )
+        try:
+            global_output = openrouter_summarize(
+                prompt, models, retry_max, retry_base_seconds
+            )
+        except Exception as exc:  # noqa: BLE001 - want a single fallback path
+            errors.append(f"OpenRouter global summarize failed: {exc}")
         if global_output:
             try:
                 data = json.loads(global_output)
